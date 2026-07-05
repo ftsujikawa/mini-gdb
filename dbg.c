@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ptrace.h>
@@ -898,6 +900,7 @@ typedef enum {
     PRINT_FMT_BINARY,
     PRINT_FMT_UNSIGNED,
     PRINT_FMT_CHAR,
+    PRINT_FMT_STRING,
     PRINT_FMT_POINTER,
 } print_format_t;
 
@@ -929,6 +932,7 @@ static const char *format_name(print_format_t fmt)
     case PRINT_FMT_BINARY:   return "binary";
     case PRINT_FMT_UNSIGNED: return "unsigned";
     case PRINT_FMT_CHAR:     return "char";
+    case PRINT_FMT_STRING:   return "string";
     case PRINT_FMT_POINTER:  return "pointer";
     case PRINT_FMT_DECIMAL:
     default:                 return "decimal";
@@ -955,6 +959,9 @@ static print_format_t parse_format_name(const char *name)
 
     if (!strcmp(name, "char"))
         return PRINT_FMT_CHAR;
+
+    if (!strcmp(name, "string"))
+        return PRINT_FMT_STRING;
 
     if (!strcmp(name, "pointer") || !strcmp(name, "addr"))
         return PRINT_FMT_POINTER;
@@ -1019,6 +1026,82 @@ static void show_print_settings(void)
         printf("Print elements: %d\n", print_settings.print_elements);
 }
 
+#define MAX_PRINT_STRING 256
+
+static int read_target_byte(unsigned long addr, unsigned char *out)
+{
+    unsigned long aligned = addr & ~(unsigned long)(sizeof(long) - 1);
+    long word = read_memory(aligned);
+
+    if (word == -1)
+        return -1;
+
+    *out = (unsigned char)(word >> (8 * (addr - aligned)));
+    return 0;
+}
+
+static void print_string_value(const char *label, unsigned long addr)
+{
+    printf("%s = \"", label);
+
+    for (int i = 0; i < MAX_PRINT_STRING; i++) {
+        unsigned char c;
+
+        if (read_target_byte(addr + (unsigned long)i, &c) != 0) {
+            printf("<error>");
+            break;
+        }
+
+        if (c == '\0')
+            break;
+
+        if (c >= 32 && c <= 126)
+            putchar(c);
+        else if (c == '\n')
+            printf("\\n");
+        else if (c == '\t')
+            printf("\\t");
+        else if (c == '\\')
+            printf("\\\\");
+        else if (c == '"')
+            printf("\\\"");
+        else
+            printf("\\x%02x", c);
+    }
+
+    printf("\"\n");
+}
+
+static unsigned long resolve_string_addr(unsigned long addr, uint32_t type_off)
+{
+    type_info_t ti;
+
+    if (type_off == 0 || get_cached_type(type_off, &ti) != 0)
+        return addr;
+
+    resolve_type_alias(&ti, NULL);
+
+    if (ti.kind == TYPE_POINTER) {
+        unsigned long ptr;
+
+        if (peek_word(addr, &ptr) == 0)
+            return ptr;
+    }
+
+    if (ti.kind == TYPE_ARRAY) {
+        type_info_t elem;
+
+        if (get_cached_type(ti.elem_type_off, &elem) == 0) {
+            resolve_type_alias(&elem, NULL);
+
+            if (elem.kind == TYPE_BASE && elem.size == 1)
+                return addr;
+        }
+    }
+
+    return addr;
+}
+
 static void print_value(const char *label,
                         unsigned long value,
                         print_format_t fmt)
@@ -1057,11 +1140,14 @@ static void print_value(const char *label,
         unsigned char c = (unsigned char)value;
 
         if (c >= 32 && c <= 126)
-            printf("%s = %d '%c'\n", label, (int)c, (char)c);
+            printf("%s = '%c'\n", label, (char)c);
         else
-            printf("%s = %d '\\x%02x'\n", label, (int)c, c);
+            printf("%s = '\\x%02x'\n", label, c);
         break;
     }
+    case PRINT_FMT_STRING:
+        print_string_value(label, value);
+        break;
     case PRINT_FMT_POINTER:
         printf("%s = %p\n", label, (void *)value);
         break;
@@ -1498,6 +1584,14 @@ static void print_eval_result(const eval_result_t *res, print_format_t fmt)
 {
     type_info_t ti;
 
+    if (fmt == PRINT_FMT_STRING) {
+        unsigned long str_addr =
+            resolve_string_addr(res->addr, res->type_off);
+
+        print_string_value(res->label, str_addr);
+        return;
+    }
+
     if (res->type_off == 0 ||
         get_cached_type(res->type_off, &ti) != 0) {
         unsigned long val;
@@ -1534,6 +1628,63 @@ static void print_eval_result(const eval_result_t *res, print_format_t fmt)
 }
 
 typedef struct {
+    const char *name;
+    size_t offset;
+} reg_info_t;
+
+static int reg_name_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
+            return 0;
+        a++;
+        b++;
+    }
+
+    return *a == *b;
+}
+
+static int lookup_register(const char *name, const reg_info_t **info_out)
+{
+    static const reg_info_t regs[] = {
+        { "rip", offsetof(struct user_regs_struct, rip) },
+        { "pc",  offsetof(struct user_regs_struct, rip) },
+        { "eip", offsetof(struct user_regs_struct, rip) },
+        { "rsp", offsetof(struct user_regs_struct, rsp) },
+        { "sp",  offsetof(struct user_regs_struct, rsp) },
+        { "rbp", offsetof(struct user_regs_struct, rbp) },
+        { "bp",  offsetof(struct user_regs_struct, rbp) },
+        { "rax", offsetof(struct user_regs_struct, rax) },
+        { "rbx", offsetof(struct user_regs_struct, rbx) },
+        { "rcx", offsetof(struct user_regs_struct, rcx) },
+        { "rdx", offsetof(struct user_regs_struct, rdx) },
+        { "rsi", offsetof(struct user_regs_struct, rsi) },
+        { "rdi", offsetof(struct user_regs_struct, rdi) },
+        { "r8",  offsetof(struct user_regs_struct, r8) },
+        { "r9",  offsetof(struct user_regs_struct, r9) },
+        { "r10", offsetof(struct user_regs_struct, r10) },
+        { "r11", offsetof(struct user_regs_struct, r11) },
+        { "r12", offsetof(struct user_regs_struct, r12) },
+        { "r13", offsetof(struct user_regs_struct, r13) },
+        { "r14", offsetof(struct user_regs_struct, r14) },
+        { "r15", offsetof(struct user_regs_struct, r15) },
+        { "eflags", offsetof(struct user_regs_struct, eflags) },
+    };
+
+    if (*name == '$')
+        name++;
+
+    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+        if (reg_name_equal(name, regs[i].name)) {
+            *info_out = &regs[i];
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+typedef struct {
     const char *cur;
     unsigned long rip;
 } ep_t;
@@ -1543,6 +1694,46 @@ typedef struct {
     int has_lval;
     eval_result_t lval;
 } c_expr_t;
+
+static int ep_parse_register(ep_t *ep, c_expr_t *out)
+{
+    const reg_info_t *reg;
+    char name[64];
+
+    if (*ep->cur != '$')
+        return 0;
+
+    ep->cur++;
+
+    ep->cur = parse_c_ident(ep->cur, name, sizeof(name));
+
+    if (!name[0]) {
+        printf("expected register name\n");
+        return -1;
+    }
+
+    if (lookup_register(name, &reg) != 0) {
+        printf("unknown register: $%s\n", name);
+        return -1;
+    }
+
+    if (!dbg.running) {
+        printf("no process\n");
+        return -1;
+    }
+
+    struct user_regs_struct regs;
+
+    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+        perror("ptrace getregs");
+        return -1;
+    }
+
+    out->value =
+        (long)*(unsigned long long *)((char *)&regs + reg->offset);
+    out->has_lval = 0;
+    return 1;
+}
 
 static int ep_is_ident_start(char c)
 {
@@ -1709,6 +1900,11 @@ static int ep_require_scalar(c_expr_t *n)
 
 static int ep_parse_primary(ep_t *ep, c_expr_t *out)
 {
+    int reg = ep_parse_register(ep, out);
+
+    if (reg != 0)
+        return reg > 0 ? 0 : -1;
+
     ep->cur = skip_spaces(ep->cur);
 
     if (*ep->cur == '(') {
@@ -2174,6 +2370,19 @@ static int ep_parse_expr(ep_t *ep, c_expr_t *out)
 
 static void print_c_expr(c_expr_t *node, const char *label, print_format_t fmt)
 {
+    if (fmt == PRINT_FMT_STRING) {
+        unsigned long str_addr;
+
+        if (node->has_lval)
+            str_addr = resolve_string_addr(node->lval.addr,
+                                           node->lval.type_off);
+        else
+            str_addr = (unsigned long)node->value;
+
+        print_string_value(label, str_addr);
+        return;
+    }
+
     if (node->has_lval && ep_is_aggregate_lval(&node->lval)) {
         print_eval_result(&node->lval, fmt);
         return;
@@ -2301,6 +2510,72 @@ static int set_variable_value(const char *args, unsigned long rip)
     return 1;
 }
 
+static int set_register_value(const char *args, unsigned long rip)
+{
+    char buf[256];
+    char *eq;
+    const reg_info_t *reg;
+
+    strncpy(buf, args, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    const char *lhs = skip_spaces(buf);
+    int forced = (*lhs == '$');
+
+    eq = strchr((char *)lhs, '=');
+
+    if (!eq)
+        return 0;
+
+    if (eq == lhs) {
+        printf("missing register name\n");
+        return 1;
+    }
+
+    *eq = '\0';
+    trim_line((char *)lhs);
+
+    if (lookup_register(lhs, &reg) != 0) {
+        if (forced) {
+            printf("unknown register: %s\n", lhs);
+            return 1;
+        }
+        return 0;
+    }
+
+    const char *rhs = skip_spaces(eq + 1);
+
+    if (!*rhs) {
+        printf("missing value\n");
+        return 1;
+    }
+
+    ep_t ep = { .cur = rhs, .rip = rip };
+    c_expr_t val;
+
+    if (ep_parse_expr(&ep, &val) != 0)
+        return 1;
+
+    struct user_regs_struct regs;
+
+    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+        perror("ptrace getregs");
+        return 1;
+    }
+
+    *(unsigned long long *)((char *)&regs + reg->offset) =
+        (unsigned long long)val.value;
+
+    if (ptrace(PTRACE_SETREGS, dbg.pid, 0, &regs) == -1) {
+        perror("ptrace setregs");
+        return 1;
+    }
+
+    printf("$%s = 0x%llx\n", reg->name,
+           (unsigned long long)val.value);
+    return 1;
+}
+
 static int parse_print_format(const char **expr, print_format_t *fmt)
 {
     const char *p = *expr;
@@ -2335,6 +2610,9 @@ static int parse_print_format(const char **expr, print_format_t *fmt)
         break;
     case 'c':
         *fmt = PRINT_FMT_CHAR;
+        break;
+    case 's':
+        *fmt = PRINT_FMT_STRING;
         break;
     case 'a':
         *fmt = PRINT_FMT_POINTER;
@@ -2528,11 +2806,15 @@ void set_command(const char *args)
 
         ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
 
+        if (set_register_value(args, regs.rip))
+            return;
+
         if (set_variable_value(args, regs.rip))
             return;
     }
 
     printf("usage:\n");
+    printf("  set $<register> = <expr>\n");
     printf("  set variable <expr> = <value>\n");
     printf("  set <expr> = <value>\n");
     printf("  set language c\n");
@@ -3363,18 +3645,17 @@ int lookup_next_line_scoped(unsigned long rip,
 
 #define SOURCE_CONTEXT 5
 
-void show_source_listing(const char *file, int line)
+int show_source_listing(const char *file, int line)
 {
     FILE *fp = fopen(file, "r");
 
-    if (!fp) {
-        printf("(cannot open %s)\n", file);
-        return;
-    }
+    if (!fp)
+        return -1;
 
     char buf[1024];
     int cur = 0;
     int start = line - SOURCE_CONTEXT;
+    int found = 0;
 
     if (start < 1)
         start = 1;
@@ -3396,12 +3677,16 @@ void show_source_listing(const char *file, int line)
             buf[len - 1] = '\0';
 
         if (cur == line)
+            found = 1;
+
+        if (cur == line)
             printf("=> %4d  %s\n", cur, buf);
         else
             printf("   %4d  %s\n", cur, buf);
     }
 
     fclose(fp);
+    return found ? 0 : -1;
 }
 
 static const char *resolve_source_file(const char *query)
@@ -3542,6 +3827,7 @@ static void show_disassembly_line(unsigned long addr)
 
     if (!fp) {
         perror("popen");
+        printf("=> 0x%lx\n", addr);
         return;
     }
 
@@ -3573,20 +3859,27 @@ static void show_disassembly_line(unsigned long addr)
     }
 
     pclose(fp);
-    printf("=> 0x%lx: (no source)\n", addr);
+    printf("=> 0x%lx\n", addr);
 }
 
-void show_pc_location(unsigned long rip)
+static void show_stop_location(unsigned long pc)
 {
     const char *file;
     int line;
 
-    if (lookup_line(rip, &file, &line) == 0) {
+    if (lookup_line(pc, &file, &line) == 0) {
         printf("=> %s:%d\n", file, line);
-        show_source_listing(file, line);
-    } else {
-        show_disassembly_line(rip);
+
+        if (show_source_listing(file, line) == 0)
+            return;
     }
+
+    show_disassembly_line(pc);
+}
+
+void show_pc_location(unsigned long rip)
+{
+    show_stop_location(rip);
 }
 
 void load_symbols(char *path)
@@ -4716,7 +5009,7 @@ void continue_execution()
                     "[+] breakpoint hit 0x%lx\n",
                     bp->addr
                 );
-                show_pc_location(bp->addr);
+                show_stop_location(bp->addr);
 
                 if (step_over_breakpoint(bp) != 0)
                     printf("[-] failed to re-enable breakpoint\n");
@@ -4733,7 +5026,7 @@ void continue_execution()
             "[+] stopped signal=%d\n",
             sig
         );
-        show_pc_location(regs.rip);
+        show_stop_location(regs.rip);
     }
 }
 
