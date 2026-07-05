@@ -17,10 +17,13 @@
 typedef struct {
     pid_t pid;
     int running;
+    int is_pie;
+    unsigned long load_base;
 } debugger_t;
 
 debugger_t dbg = {0};
 char debuggee_path[512];
+char debuggee_realpath[512];
 
 #define MAX_BREAKPOINTS 32
 
@@ -83,10 +86,69 @@ typedef struct {
     var_loc_t loc;
     long fbreg;
     unsigned long addr;
+    uint32_t type_off;
 } var_entry_t;
 
 var_entry_t vars[MAX_VARS];
 int var_count = 0;
+
+#define DW_TAG_array_type       0x01
+#define DW_TAG_member           0x0d
+#define DW_TAG_pointer_type     0x0f
+#define DW_TAG_structure_type   0x13
+#define DW_TAG_typedef          0x16
+#define DW_TAG_subrange_type    0x21
+#define DW_TAG_base_type        0x24
+#define DW_TAG_const_type       0x26
+
+#define DW_AT_type              0x49
+#define DW_AT_byte_size         0x0b
+#define DW_AT_encoding          0x3e
+#define DW_AT_data_member_location 0x38
+#define DW_AT_upper_bound       0x2f
+
+#define DW_ATE_signed           0x05
+#define DW_ATE_unsigned         0x07
+
+typedef enum {
+    TYPE_UNKNOWN,
+    TYPE_BASE,
+    TYPE_POINTER,
+    TYPE_STRUCT,
+    TYPE_ARRAY,
+    TYPE_ALIAS,
+} type_kind_t;
+
+typedef struct {
+    char name[64];
+    uint32_t type_off;
+    long offset;
+} dwarf_member_t;
+
+typedef struct {
+    type_kind_t kind;
+    size_t size;
+    int encoding;
+    uint32_t ref_off;
+    char struct_name[64];
+    dwarf_member_t members[16];
+    int member_count;
+    uint32_t elem_type_off;
+    int array_count;
+} type_info_t;
+
+#define MAX_TYPE_CACHE 128
+
+typedef struct {
+    uint32_t off;
+    type_info_t info;
+} type_cache_entry_t;
+
+static type_cache_entry_t type_cache[MAX_TYPE_CACHE];
+static int type_cache_count = 0;
+static size_t current_cu_base = 0;
+
+static int get_type_info(uint32_t off, type_info_t *out);
 
 #define DW_TAG_compile_unit     0x11
 #define DW_TAG_subprogram       0x2e
@@ -123,7 +185,11 @@ int var_count = 0;
 static uint64_t read_uleb128(const uint8_t *data, size_t len, size_t *off);
 static int64_t read_sleb128(const uint8_t *data, size_t len, size_t *off);
 long read_memory(unsigned long addr);
+static int peek_word(unsigned long addr, unsigned long *value);
+static int poke_word(unsigned long addr, unsigned long value);
 int lookup_symbol(const char *name, unsigned long *addr);
+static unsigned long to_debug_addr(unsigned long addr);
+static unsigned long to_runtime_addr(unsigned long addr);
 
 typedef struct {
     uint64_t code;
@@ -261,7 +327,8 @@ static void add_var_entry(const char *name,
                           unsigned long scope_low,
                           unsigned long scope_high,
                           const uint8_t *loc,
-                          size_t loc_len)
+                          size_t loc_len,
+                          uint32_t type_off)
 {
     if (!name || !name[0] || var_count >= MAX_VARS)
         return;
@@ -286,7 +353,324 @@ static void add_var_entry(const char *name,
     v->name[sizeof(v->name) - 1] = '\0';
     v->scope_low = scope_low;
     v->scope_high = scope_high;
+    v->type_off = type_off;
     var_count++;
+}
+
+static uint64_t read_attr_number(uint8_t form, const uint8_t *data)
+{
+    switch (form) {
+    case DWARF_FORM_data1:
+        return data[0];
+    case DWARF_FORM_data2:
+        return *(uint16_t *)data;
+    case DWARF_FORM_data4:
+        return *(uint32_t *)data;
+    case DWARF_FORM_data8:
+        return *(uint64_t *)data;
+    default:
+        return 0;
+    }
+}
+
+static int type_cache_lookup(uint32_t off, type_info_t *out)
+{
+    for (int i = 0; i < type_cache_count; i++) {
+        if (type_cache[i].off == off) {
+            *out = type_cache[i].info;
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int get_cached_type(uint32_t off, type_info_t *out)
+{
+    if (off == 0)
+        return -1;
+
+    if (type_cache_lookup(off, out) == 0)
+        return 0;
+
+    return get_type_info(off, out);
+}
+
+static void cache_type(uint32_t off, const type_info_t *info)
+{
+    for (int i = 0; i < type_cache_count; i++) {
+        if (type_cache[i].off == off)
+            return;
+    }
+
+    if (type_cache_count >= MAX_TYPE_CACHE)
+        return;
+
+    type_cache[type_cache_count].off = off;
+    type_cache[type_cache_count].info = *info;
+    type_cache_count++;
+}
+
+static void parse_struct_members(size_t *off,
+                                 size_t unit_end,
+                                 type_info_t *ti)
+{
+    while (*off < unit_end) {
+        size_t die_start = *off;
+        uint64_t abcode = read_uleb128(debug_info, unit_end, off);
+
+        if (abcode == 0)
+            return;
+
+        dwarf_abbrev_t *ab = find_abbrev(abcode);
+
+        if (!ab)
+            return;
+
+        char member_name[64] = {0};
+        uint32_t member_type = 0;
+        long member_offset = 0;
+        int has_offset = 0;
+
+        for (int i = 0; i < ab->nattr; i++) {
+            size_t attr_off = *off;
+
+            if (ab->attr[i] == DW_AT_name) {
+                const char *s = read_attr_string(ab->form[i], ab->implicit[i],
+                                                 debug_info, debug_info_size,
+                                                 &attr_off);
+                if (s)
+                    strncpy(member_name, s, sizeof(member_name) - 1);
+            } else if (ab->attr[i] == DW_AT_type &&
+                       ab->form[i] == DWARF_FORM_ref4) {
+                uint32_t ref = *(uint32_t *)(debug_info + attr_off);
+                member_type = (uint32_t)(current_cu_base + ref);
+            } else if (ab->attr[i] == DW_AT_data_member_location) {
+                if (ab->form[i] == DWARF_FORM_data1 ||
+                    ab->form[i] == DWARF_FORM_data2 ||
+                    ab->form[i] == DWARF_FORM_data4 ||
+                    ab->form[i] == DWARF_FORM_data8) {
+                    member_offset =
+                        (long)read_attr_number(ab->form[i],
+                                               debug_info + attr_off);
+                    has_offset = 1;
+                }
+            }
+
+            skip_attr(ab->form[i], ab->implicit[i],
+                      debug_info, unit_end, off);
+        }
+
+        if (ab->tag == DW_TAG_member && member_name[0] && member_type &&
+            ti->member_count < (int)(sizeof(ti->members) /
+                                     sizeof(ti->members[0]))) {
+            dwarf_member_t *m = &ti->members[ti->member_count++];
+
+            strncpy(m->name, member_name, sizeof(m->name) - 1);
+            m->type_off = member_type;
+            m->offset = has_offset ? member_offset : 0;
+        }
+
+        if (ab->has_children)
+            parse_struct_members(off, unit_end, ti);
+
+        (void)die_start;
+    }
+}
+
+static int parse_type_die(uint32_t off, type_info_t *out)
+{
+    if (off == 0 || off >= debug_info_size)
+        return -1;
+
+    type_info_t cached;
+
+    if (type_cache_lookup(off, &cached) == 0) {
+        *out = cached;
+        return 0;
+    }
+
+    size_t die_off = off;
+    uint64_t abcode = read_uleb128(debug_info, debug_info_size, &die_off);
+
+    if (abcode == 0)
+        return -1;
+
+    dwarf_abbrev_t *ab = find_abbrev(abcode);
+
+    if (!ab)
+        return -1;
+
+    type_info_t ti = {0};
+
+    ti.kind = TYPE_UNKNOWN;
+    ti.size = 0;
+    ti.ref_off = 0;
+    ti.array_count = 0;
+
+    uint32_t ref_type = 0;
+    int array_upper = -1;
+
+    for (int i = 0; i < ab->nattr; i++) {
+        size_t attr_off = die_off;
+
+        if (ab->attr[i] == DW_AT_name) {
+            const char *s = read_attr_string(ab->form[i], ab->implicit[i],
+                                             debug_info, debug_info_size,
+                                             &attr_off);
+            if (s && ab->tag == DW_TAG_structure_type)
+                strncpy(ti.struct_name, s, sizeof(ti.struct_name) - 1);
+        } else if (ab->attr[i] == DW_AT_byte_size &&
+                   (ab->form[i] == DWARF_FORM_data1 ||
+                    ab->form[i] == DWARF_FORM_data2 ||
+                    ab->form[i] == DWARF_FORM_data4 ||
+                    ab->form[i] == DWARF_FORM_data8)) {
+            ti.size = (size_t)read_attr_number(ab->form[i],
+                                               debug_info + attr_off);
+        } else if (ab->attr[i] == DW_AT_encoding &&
+                   (ab->form[i] == DWARF_FORM_data1 ||
+                    ab->form[i] == DWARF_FORM_data2 ||
+                    ab->form[i] == DWARF_FORM_data4)) {
+            ti.encoding = (int)read_attr_number(ab->form[i],
+                                                debug_info + attr_off);
+        } else if (ab->attr[i] == DW_AT_type &&
+                   ab->form[i] == DWARF_FORM_ref4) {
+            uint32_t ref = *(uint32_t *)(debug_info + attr_off);
+            ref_type = (uint32_t)(current_cu_base + ref);
+        } else if (ab->attr[i] == DW_AT_upper_bound &&
+                   (ab->form[i] == DWARF_FORM_data1 ||
+                    ab->form[i] == DWARF_FORM_data2 ||
+                    ab->form[i] == DWARF_FORM_data4 ||
+                    ab->form[i] == DWARF_FORM_data8)) {
+            array_upper = (int)read_attr_number(ab->form[i],
+                                                debug_info + attr_off);
+        }
+
+        skip_attr(ab->form[i], ab->implicit[i],
+                  debug_info, debug_info_size, &die_off);
+    }
+
+    switch (ab->tag) {
+    case DW_TAG_base_type:
+        ti.kind = TYPE_BASE;
+        if (ti.size == 0)
+            ti.size = 4;
+        break;
+    case DW_TAG_pointer_type:
+        ti.kind = TYPE_POINTER;
+        ti.ref_off = ref_type;
+        if (ti.size == 0)
+            ti.size = dwarf_addr_size;
+        break;
+    case DW_TAG_structure_type:
+        ti.kind = TYPE_STRUCT;
+        if (ab->has_children) {
+            size_t child_off = die_off;
+            parse_struct_members(&child_off, debug_info_size, &ti);
+        }
+        break;
+    case DW_TAG_array_type:
+        ti.kind = TYPE_ARRAY;
+        ti.ref_off = ref_type;
+        ti.elem_type_off = ref_type;
+        if (ab->has_children) {
+            size_t child_off = die_off;
+
+            while (child_off < debug_info_size) {
+                uint64_t subcode =
+                    read_uleb128(debug_info, debug_info_size, &child_off);
+
+                if (subcode == 0)
+                    break;
+
+                dwarf_abbrev_t *sub = find_abbrev(subcode);
+
+                if (!sub)
+                    break;
+
+                for (int j = 0; j < sub->nattr; j++) {
+                    size_t attr_off = child_off;
+
+                    if (sub->attr[j] == DW_AT_upper_bound &&
+                        (sub->form[j] == DWARF_FORM_data1 ||
+                         sub->form[j] == DWARF_FORM_data2 ||
+                         sub->form[j] == DWARF_FORM_data4 ||
+                         sub->form[j] == DWARF_FORM_data8)) {
+                        array_upper =
+                            (int)read_attr_number(sub->form[j],
+                                                  debug_info + attr_off);
+                    }
+
+                    skip_attr(sub->form[j], sub->implicit[j],
+                              debug_info, debug_info_size, &child_off);
+                }
+            }
+        }
+
+        if (array_upper >= 0)
+            ti.array_count = array_upper + 1;
+        break;
+    case DW_TAG_typedef:
+    case DW_TAG_const_type:
+        if (ref_type) {
+            if (get_type_info(ref_type, &ti) != 0)
+                return -1;
+            ti.kind = TYPE_ALIAS;
+            ti.ref_off = ref_type;
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (ti.kind == TYPE_ARRAY && ti.ref_off) {
+        type_info_t elem;
+
+        if (get_type_info(ti.ref_off, &elem) == 0)
+            ti.size = elem.size * (size_t)ti.array_count;
+    }
+
+    cache_type(off, &ti);
+    *out = ti;
+    return 0;
+}
+
+static int get_type_info(uint32_t off, type_info_t *out)
+{
+    if (type_cache_lookup(off, out) == 0)
+        return 0;
+
+    return parse_type_die(off, out);
+}
+
+static void resolve_type_alias(type_info_t *ti, uint32_t *orig_off)
+{
+    int depth = 0;
+
+    while (ti->kind == TYPE_ALIAS && ti->ref_off && depth < 8) {
+        if (*orig_off == 0)
+            *orig_off = ti->ref_off;
+
+        type_info_t next;
+
+        if (get_cached_type(ti->ref_off, &next) != 0)
+            break;
+
+        *ti = next;
+        depth++;
+    }
+}
+
+static void preload_types(void)
+{
+    for (int i = 0; i < var_count; i++) {
+        if (!vars[i].type_off)
+            continue;
+
+        type_info_t ti;
+
+        get_type_info(vars[i].type_off, &ti);
+    }
 }
 
 static void parse_dies(size_t *off,
@@ -312,6 +696,7 @@ static void parse_dies(size_t *off,
         unsigned long high_pc = 0;
         int has_low = 0;
         int has_high = 0;
+        uint32_t type_off = 0;
 
         for (int i = 0; i < ab->nattr; i++) {
             size_t attr_off = *off;
@@ -350,6 +735,10 @@ static void parse_dies(size_t *off,
                     loc_len = debug_info[attr_off];
                     loc = debug_info + attr_off + 1;
                 }
+            } else if (ab->attr[i] == DW_AT_type &&
+                       ab->form[i] == DWARF_FORM_ref4) {
+                uint32_t ref = *(uint32_t *)(debug_info + attr_off);
+                type_off = (uint32_t)(current_cu_base + ref);
             }
 
             skip_attr(ab->form[i], ab->implicit[i],
@@ -367,7 +756,8 @@ static void parse_dies(size_t *off,
         if ((ab->tag == DW_TAG_variable ||
              ab->tag == DW_TAG_formal_parameter) &&
             name[0] && loc && loc_len > 0) {
-            add_var_entry(name, scope_low, scope_high, loc, loc_len);
+            add_var_entry(name, scope_low, scope_high, loc, loc_len,
+                          type_off);
         }
 
         if (ab->has_children)
@@ -435,6 +825,7 @@ void load_variables(char *path)
     size_t off = 0;
 
     while (off + 4 <= debug_info_size) {
+        size_t cu_base = off;
         uint32_t unit_length =
             *(uint32_t *)(debug_info + off);
 
@@ -459,9 +850,12 @@ void load_variables(char *path)
             off++;
         }
 
+        current_cu_base = cu_base;
         parse_dies(&off, unit_end, 0, ~0UL);
         off = unit_end;
     }
+
+    preload_types();
 
 out:
     munmap(map, st.st_size);
@@ -475,6 +869,8 @@ static var_entry_t *lookup_var(const char *name, unsigned long rip)
 {
     var_entry_t *best = NULL;
     unsigned long best_size = ~0UL;
+
+    rip = to_debug_addr(rip);
 
     for (int i = 0; i < var_count; i++) {
         if (strcmp(vars[i].name, name))
@@ -494,34 +890,207 @@ static var_entry_t *lookup_var(const char *name, unsigned long rip)
     return best;
 }
 
-void print_variable(const char *name)
+typedef enum {
+    PRINT_FMT_DEFAULT = -1,
+    PRINT_FMT_DECIMAL,
+    PRINT_FMT_HEX,
+    PRINT_FMT_OCTAL,
+    PRINT_FMT_BINARY,
+    PRINT_FMT_UNSIGNED,
+    PRINT_FMT_CHAR,
+    PRINT_FMT_POINTER,
+} print_format_t;
+
+typedef enum {
+    LANG_C,
+} language_t;
+
+typedef struct {
+    language_t language;
+    print_format_t format;
+    int print_array;
+    int print_pretty;
+    int print_elements;
+} print_settings_t;
+
+static print_settings_t print_settings = {
+    .language = LANG_C,
+    .format = PRINT_FMT_DECIMAL,
+    .print_array = 1,
+    .print_pretty = 0,
+    .print_elements = -1,
+};
+
+static const char *format_name(print_format_t fmt)
 {
-    if (!dbg.running) {
-        printf("no process\n");
-        return;
+    switch (fmt) {
+    case PRINT_FMT_HEX:      return "hex";
+    case PRINT_FMT_OCTAL:    return "octal";
+    case PRINT_FMT_BINARY:   return "binary";
+    case PRINT_FMT_UNSIGNED: return "unsigned";
+    case PRINT_FMT_CHAR:     return "char";
+    case PRINT_FMT_POINTER:  return "pointer";
+    case PRINT_FMT_DECIMAL:
+    default:                 return "decimal";
+    }
+}
+
+static print_format_t parse_format_name(const char *name)
+{
+    if (!strcmp(name, "dec") || !strcmp(name, "decimal") ||
+        !strcmp(name, "signed"))
+        return PRINT_FMT_DECIMAL;
+
+    if (!strcmp(name, "hex"))
+        return PRINT_FMT_HEX;
+
+    if (!strcmp(name, "oct") || !strcmp(name, "octal"))
+        return PRINT_FMT_OCTAL;
+
+    if (!strcmp(name, "bin") || !strcmp(name, "binary"))
+        return PRINT_FMT_BINARY;
+
+    if (!strcmp(name, "unsigned"))
+        return PRINT_FMT_UNSIGNED;
+
+    if (!strcmp(name, "char"))
+        return PRINT_FMT_CHAR;
+
+    if (!strcmp(name, "pointer") || !strcmp(name, "addr"))
+        return PRINT_FMT_POINTER;
+
+    return PRINT_FMT_DEFAULT;
+}
+
+static int parse_on_off(const char *name, int *value)
+{
+    if (!strcmp(name, "on") || !strcmp(name, "1") || !strcmp(name, "yes")) {
+        *value = 1;
+        return 0;
     }
 
-    struct user_regs_struct regs;
+    if (!strcmp(name, "off") || !strcmp(name, "0") || !strcmp(name, "no")) {
+        *value = 0;
+        return 0;
+    }
 
-    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+    return -1;
+}
 
-    var_entry_t *v = lookup_var(name, regs.rip);
+static void trim_line(char *s)
+{
+    size_t len = strlen(s);
+
+    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r' ||
+                       s[len - 1] == ' ' || s[len - 1] == '\t')) {
+        s[--len] = '\0';
+    }
+}
+
+static void show_print_settings(void)
+{
+    printf("Language: C\n");
+    printf("Print format: %s\n", format_name(print_settings.format));
+    printf("Output radix: ");
+
+    switch (print_settings.format) {
+    case PRINT_FMT_OCTAL:
+        printf("8\n");
+        break;
+    case PRINT_FMT_HEX:
+        printf("16\n");
+        break;
+    case PRINT_FMT_BINARY:
+        printf("2\n");
+        break;
+    default:
+        printf("10\n");
+        break;
+    }
+
+    printf("Print array: %s\n",
+           print_settings.print_array ? "on" : "off");
+    printf("Print pretty: %s\n",
+           print_settings.print_pretty ? "on" : "off");
+
+    if (print_settings.print_elements < 0)
+        printf("Print elements: unlimited\n");
+    else
+        printf("Print elements: %d\n", print_settings.print_elements);
+}
+
+static void print_value(const char *label,
+                        unsigned long value,
+                        print_format_t fmt)
+{
+    if (fmt == PRINT_FMT_DEFAULT)
+        fmt = print_settings.format;
+
+    switch (fmt) {
+    case PRINT_FMT_HEX:
+        printf("%s = 0x%lx\n", label, value);
+        break;
+    case PRINT_FMT_OCTAL:
+        printf("%s = %#lo\n", label, value);
+        break;
+    case PRINT_FMT_BINARY: {
+        printf("%s = 0b", label);
+        int started = 0;
+
+        for (int i = 63; i >= 0; i--) {
+            int bit = (value >> i) & 1;
+
+            if (bit)
+                started = 1;
+
+            if (started || i == 0)
+                putchar(bit ? '1' : '0');
+        }
+
+        putchar('\n');
+        break;
+    }
+    case PRINT_FMT_UNSIGNED:
+        printf("%s = %lu\n", label, value);
+        break;
+    case PRINT_FMT_CHAR: {
+        unsigned char c = (unsigned char)value;
+
+        if (c >= 32 && c <= 126)
+            printf("%s = %d '%c'\n", label, (int)c, (char)c);
+        else
+            printf("%s = %d '\\x%02x'\n", label, (int)c, c);
+        break;
+    }
+    case PRINT_FMT_POINTER:
+        printf("%s = %p\n", label, (void *)value);
+        break;
+    case PRINT_FMT_DECIMAL:
+    default:
+        printf("%s = %ld\n", label, (long)value);
+        break;
+    }
+}
+
+static int read_var_addr(const char *name,
+                         unsigned long rip,
+                         unsigned long *addr_out,
+                         uint32_t *type_off_out)
+{
+    var_entry_t *v = lookup_var(name, rip);
 
     if (v) {
-        unsigned long addr;
+        struct user_regs_struct regs;
+
+        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
 
         if (v->loc == VAR_FBREG)
-            addr = regs.rbp + 16 + v->fbreg;
+            *addr_out = regs.rbp + 16 + v->fbreg;
         else
-            addr = v->addr;
+            *addr_out = to_runtime_addr(v->addr);
 
-        long word = read_memory(addr);
-
-        if (word == -1)
-            return;
-
-        printf("%s = %d\n", name, (int)word);
-        return;
+        *type_off_out = v->type_off;
+        return 0;
     }
 
     for (int i = 0; i < sym_count; i++) {
@@ -529,17 +1098,934 @@ void print_variable(const char *name)
             continue;
 
         if (!strcmp(symbols[i].name, name)) {
-            long word = read_memory(symbols[i].addr);
-
-            if (word == -1)
-                return;
-
-            printf("%s = %ld\n", name, word);
-            return;
+            *addr_out = to_runtime_addr(symbols[i].addr);
+            *type_off_out = 0;
+            return 0;
         }
     }
 
-    printf("unknown variable: %s\n", name);
+    return -1;
+}
+
+static int read_typed_value(unsigned long addr,
+                            const type_info_t *ti,
+                            unsigned long *value_out)
+{
+    type_info_t resolved = *ti;
+    uint32_t orig = 0;
+
+    resolve_type_alias(&resolved, &orig);
+
+    if (resolved.kind == TYPE_POINTER) {
+        if (peek_word(addr, value_out) != 0)
+            return -1;
+        return 0;
+    }
+
+    if (resolved.kind != TYPE_BASE)
+        return -1;
+
+    long word = read_memory(addr);
+
+    if (word == -1)
+        return -1;
+
+    if (resolved.size <= 1)
+        *value_out = (unsigned long)(word & 0xff);
+    else if (resolved.size <= 2)
+        *value_out = (unsigned long)(word & 0xffff);
+    else if (resolved.size <= 4)
+        *value_out = (unsigned long)(uint32_t)word;
+    else
+        *value_out = (unsigned long)word;
+
+    return 0;
+}
+
+static int poke_word(unsigned long addr, unsigned long value)
+{
+    errno = 0;
+
+    if (ptrace(PTRACE_POKEDATA, dbg.pid, (void *)addr,
+               (void *)value) == -1) {
+        perror("ptrace poke");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int write_typed_value(unsigned long addr,
+                             const type_info_t *ti,
+                             unsigned long value)
+{
+    type_info_t resolved = *ti;
+    uint32_t orig = 0;
+
+    resolve_type_alias(&resolved, &orig);
+
+    if (resolved.kind != TYPE_BASE &&
+        resolved.kind != TYPE_POINTER) {
+        printf("cannot assign to aggregate type\n");
+        return -1;
+    }
+
+    size_t size = resolved.size;
+
+    if (resolved.kind == TYPE_POINTER)
+        size = dwarf_addr_size;
+
+    if (size == 0)
+        size = 4;
+
+    long word = read_memory(addr);
+
+    if (word == -1)
+        return -1;
+
+    unsigned long mask;
+
+    if (size <= 1)
+        mask = 0xff;
+    else if (size <= 2)
+        mask = 0xffff;
+    else if (size <= 4)
+        mask = 0xffffffffUL;
+    else
+        mask = ~0UL;
+
+    long patched = (word & ~(long)mask) | (long)(value & mask);
+
+    return poke_word(addr, (unsigned long)patched);
+}
+
+static void append_label(char *label, size_t labelsz, const char *suffix)
+{
+    size_t cur = strlen(label);
+
+    if (cur + 1 >= labelsz)
+        return;
+
+    strncat(label, suffix, labelsz - cur - 1);
+}
+
+static const char *skip_spaces(const char *p)
+{
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    return p;
+}
+
+static const char *parse_c_ident(const char *p, char *out, size_t outsz)
+{
+    size_t i = 0;
+
+    if (!((*p >= 'a' && *p <= 'z') ||
+          (*p >= 'A' && *p <= 'Z') || *p == '_'))
+        return NULL;
+
+    while ((*p >= 'a' && *p <= 'z') ||
+           (*p >= 'A' && *p <= 'Z') ||
+           (*p >= '0' && *p <= '9') || *p == '_') {
+        if (i + 1 < outsz)
+            out[i++] = *p;
+        p++;
+    }
+
+    out[i] = '\0';
+    return p;
+}
+
+typedef struct {
+    unsigned long addr;
+    uint32_t type_off;
+    char label[256];
+} eval_result_t;
+
+static int resolve_member(eval_result_t *res, const char *member)
+{
+    type_info_t ti;
+
+    if (get_cached_type(res->type_off, &ti) != 0)
+        return -1;
+
+    resolve_type_alias(&ti, &res->type_off);
+
+    if (ti.kind != TYPE_STRUCT) {
+        printf("not a struct: %s\n", res->label);
+        return -1;
+    }
+
+    for (int i = 0; i < ti.member_count; i++) {
+        if (!strcmp(ti.members[i].name, member)) {
+            res->addr += (unsigned long)ti.members[i].offset;
+            res->type_off = ti.members[i].type_off;
+            return 0;
+        }
+    }
+
+    printf("no member '%s' in %s\n", member, res->label);
+    return -1;
+}
+
+static int apply_member(eval_result_t *res, const char *member)
+{
+    if (resolve_member(res, member) != 0)
+        return -1;
+
+    append_label(res->label, sizeof(res->label), ".");
+    append_label(res->label, sizeof(res->label), member);
+    return 0;
+}
+
+static int apply_index(eval_result_t *res, long index)
+{
+    type_info_t ti;
+
+    if (get_cached_type(res->type_off, &ti) != 0)
+        return -1;
+
+    resolve_type_alias(&ti, &res->type_off);
+
+    if (ti.kind != TYPE_ARRAY) {
+        printf("not an array: %s\n", res->label);
+        return -1;
+    }
+
+    if (index < 0 || index >= ti.array_count) {
+        printf("index %ld out of range for %s\n", index, res->label);
+        return -1;
+    }
+
+    type_info_t elem;
+
+    if (get_cached_type(ti.elem_type_off, &elem) != 0)
+        return -1;
+
+    resolve_type_alias(&elem, &res->type_off);
+
+    res->addr += (unsigned long)(index * (long)elem.size);
+    res->type_off = ti.elem_type_off;
+
+    char idx[32];
+
+    snprintf(idx, sizeof(idx), "[%ld]", index);
+    append_label(res->label, sizeof(res->label), idx);
+    return 0;
+}
+
+static int apply_deref(eval_result_t *res, int update_label)
+{
+    type_info_t ti;
+
+    if (get_cached_type(res->type_off, &ti) != 0)
+        return -1;
+
+    resolve_type_alias(&ti, &res->type_off);
+
+    if (ti.kind != TYPE_POINTER) {
+        printf("cannot dereference non-pointer: %s\n", res->label);
+        return -1;
+    }
+
+    unsigned long ptr;
+
+    if (peek_word(res->addr, &ptr) != 0)
+        return -1;
+
+    if (update_label) {
+        size_t len = strlen(res->label);
+
+        if (len + 1 >= sizeof(res->label))
+            len = sizeof(res->label) - 2;
+
+        memmove(res->label + 1, res->label, len + 1);
+        res->label[0] = '*';
+    }
+
+    res->addr = ptr;
+    res->type_off = ti.ref_off;
+    return 0;
+}
+
+static void print_struct_members_inline(unsigned long addr,
+                                        const type_info_t *ti)
+{
+    if (print_settings.print_pretty) {
+        printf("{\n");
+
+        for (int i = 0; i < ti->member_count; i++) {
+            type_info_t mt;
+
+            if (get_cached_type(ti->members[i].type_off, &mt) != 0)
+                continue;
+
+            resolve_type_alias(&mt, NULL);
+
+            unsigned long mval;
+
+            if (read_typed_value(addr + (unsigned long)ti->members[i].offset,
+                                 &mt, &mval) != 0)
+                continue;
+
+            printf("  %s = ", ti->members[i].name);
+
+            if (mt.kind == TYPE_POINTER)
+                printf("%p", (void *)mval);
+            else if (mt.encoding == DW_ATE_unsigned)
+                printf("%lu", mval);
+            else
+                printf("%ld", (long)mval);
+
+            if (i + 1 < ti->member_count)
+                putchar(',');
+
+            putchar('\n');
+        }
+
+        printf("}");
+        return;
+    }
+
+    printf("{");
+
+    for (int i = 0; i < ti->member_count; i++) {
+        type_info_t mt;
+
+        if (get_cached_type(ti->members[i].type_off, &mt) != 0)
+            continue;
+
+        resolve_type_alias(&mt, NULL);
+
+        unsigned long mval;
+
+        if (read_typed_value(addr + (unsigned long)ti->members[i].offset,
+                             &mt, &mval) != 0)
+            continue;
+
+        if (i > 0)
+            printf(", ");
+
+        printf("%s = ", ti->members[i].name);
+
+        if (mt.kind == TYPE_POINTER)
+            printf("%p", (void *)mval);
+        else if (mt.encoding == DW_ATE_unsigned)
+            printf("%lu", mval);
+        else
+            printf("%ld", (long)mval);
+    }
+
+    printf("}");
+}
+
+static void print_struct_value(const char *label,
+                               unsigned long addr,
+                               const type_info_t *ti,
+                               print_format_t fmt)
+{
+    if (label[0])
+        printf("%s = ", label);
+
+    print_struct_members_inline(addr, ti);
+    putchar('\n');
+    (void)fmt;
+}
+
+static void print_array_value(const char *label,
+                              unsigned long addr,
+                              const type_info_t *ti,
+                              print_format_t fmt)
+{
+    if (!print_settings.print_array) {
+        print_value(label, addr, PRINT_FMT_POINTER);
+        return;
+    }
+
+    type_info_t elem;
+
+    if (get_cached_type(ti->elem_type_off, &elem) != 0) {
+        printf("%s = <array>\n", label);
+        return;
+    }
+
+    resolve_type_alias(&elem, NULL);
+
+    int count = ti->array_count;
+
+    if (print_settings.print_elements >= 0 &&
+        count > print_settings.print_elements)
+        count = print_settings.print_elements;
+
+    printf("%s = {", label);
+
+    for (int i = 0; i < count; i++) {
+        unsigned long elem_addr =
+            addr + (unsigned long)(i * (long)elem.size);
+
+        if (elem.kind == TYPE_STRUCT) {
+            if (i > 0)
+                printf(", ");
+            print_struct_members_inline(elem_addr, &elem);
+        } else {
+            unsigned long val;
+
+            if (read_typed_value(elem_addr, &elem, &val) != 0)
+                continue;
+
+            if (i > 0)
+                printf(", ");
+
+            if (elem.kind == TYPE_POINTER)
+                printf("%p", (void *)val);
+            else if (elem.encoding == DW_ATE_unsigned)
+                printf("%lu", val);
+            else
+                printf("%ld", (long)val);
+        }
+    }
+
+    if (print_settings.print_elements >= 0 &&
+        ti->array_count > print_settings.print_elements)
+        printf(", ...");
+
+    printf("}\n");
+    (void)fmt;
+}
+
+static void print_eval_result(const eval_result_t *res, print_format_t fmt)
+{
+    type_info_t ti;
+
+    if (res->type_off == 0 ||
+        get_cached_type(res->type_off, &ti) != 0) {
+        unsigned long val;
+
+        if (peek_word(res->addr, &val) != 0)
+            return;
+
+        print_value(res->label, val, fmt);
+        return;
+    }
+
+    resolve_type_alias(&ti, NULL);
+
+    if (ti.kind == TYPE_STRUCT) {
+        print_struct_value(res->label, res->addr, &ti, fmt);
+        return;
+    }
+
+    if (ti.kind == TYPE_ARRAY) {
+        print_array_value(res->label, res->addr, &ti, fmt);
+        return;
+    }
+
+    unsigned long val;
+
+    if (read_typed_value(res->addr, &ti, &val) != 0)
+        return;
+
+    if (ti.kind == TYPE_POINTER &&
+        fmt == PRINT_FMT_DEFAULT)
+        fmt = PRINT_FMT_POINTER;
+
+    print_value(res->label, val, fmt);
+}
+
+static int eval_lvalue(const char *expr,
+                       unsigned long rip,
+                       eval_result_t *res)
+{
+    const char *p = skip_spaces(expr);
+    int deref = 0;
+
+    while (*p == '*') {
+        deref = 1;
+        p = skip_spaces(p + 1);
+    }
+
+    char name[64];
+
+    p = parse_c_ident(p, name, sizeof(name));
+
+    if (!p || !name[0])
+        return -1;
+
+    if (read_var_addr(name, rip, &res->addr, &res->type_off) != 0) {
+        printf("unknown variable: %s\n", name);
+        return -1;
+    }
+
+    strncpy(res->label, name, sizeof(res->label) - 1);
+    res->label[sizeof(res->label) - 1] = '\0';
+
+    if (deref && apply_deref(res, 1) != 0)
+        return -1;
+
+    p = skip_spaces(p);
+
+    while (*p) {
+        if (*p == '.') {
+            char member[64];
+
+            p = parse_c_ident(p + 1, member, sizeof(member));
+
+            if (!p || !member[0]) {
+                printf("expected member name after '.'\n");
+                return -1;
+            }
+
+            if (apply_member(res, member) != 0)
+                return -1;
+        } else if (*p == '-' && p[1] == '>') {
+            char base_label[256];
+            char member[64];
+
+            strncpy(base_label, res->label, sizeof(base_label) - 1);
+            base_label[sizeof(base_label) - 1] = '\0';
+
+            if (apply_deref(res, 0) != 0)
+                return -1;
+
+            p += 2;
+            p = skip_spaces(p);
+            p = parse_c_ident(p, member, sizeof(member));
+
+            if (!p || !member[0]) {
+                printf("expected member name after '->'\n");
+                return -1;
+            }
+
+            if (resolve_member(res, member) != 0)
+                return -1;
+
+            strncpy(res->label, base_label, sizeof(res->label) - 1);
+            res->label[sizeof(res->label) - 1] = '\0';
+            append_label(res->label, sizeof(res->label), "->");
+            append_label(res->label, sizeof(res->label), member);
+        } else if (*p == '[') {
+            char *end;
+            long index = strtol(p + 1, &end, 10);
+
+            if (end == p + 1 || *end != ']') {
+                printf("invalid array index\n");
+                return -1;
+            }
+
+            if (apply_index(res, index) != 0)
+                return -1;
+
+            p = end + 1;
+        } else {
+            printf("syntax error near '%s'\n", p);
+            return -1;
+        }
+
+        p = skip_spaces(p);
+    }
+
+    return 0;
+}
+
+static int eval_expression(const char *expr,
+                           unsigned long rip,
+                           eval_result_t *res)
+{
+    if (eval_lvalue(expr, rip, res) != 0) {
+        if (!*skip_spaces(expr))
+            printf("usage: print [/format] expr\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int set_variable_value(const char *args, unsigned long rip)
+{
+    char buf[256];
+    char *eq;
+
+    strncpy(buf, args, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    const char *lhs = buf;
+
+    if (!strncmp(lhs, "variable ", 9))
+        lhs += 9;
+
+    lhs = skip_spaces(lhs);
+    eq = strchr((char *)lhs, '=');
+
+    if (!eq)
+        return 0;
+
+    if (eq == lhs) {
+        printf("missing variable name\n");
+        return 1;
+    }
+
+    *eq = '\0';
+    trim_line((char *)lhs);
+
+    const char *rhs = skip_spaces(eq + 1);
+
+    if (!*rhs) {
+        printf("missing value\n");
+        return 1;
+    }
+
+    eval_result_t res;
+
+    if (eval_lvalue(lhs, rip, &res) != 0)
+        return 1;
+
+    char *end;
+    unsigned long val = strtoul(rhs, &end, 0);
+
+    while (*end == ' ' || *end == '\t')
+        end++;
+
+    if (end == (char *)rhs || *end != '\0') {
+        printf("invalid value: %s\n", rhs);
+        return 1;
+    }
+
+    type_info_t ti = {
+        .kind = TYPE_BASE,
+        .size = 4,
+        .encoding = DW_ATE_signed,
+    };
+
+    if (res.type_off != 0 &&
+        get_cached_type(res.type_off, &ti) != 0) {
+        printf("unknown type for %s\n", res.label);
+        return 1;
+    }
+
+    if (write_typed_value(res.addr, &ti, val) != 0)
+        return 1;
+
+    print_eval_result(&res, PRINT_FMT_DEFAULT);
+    return 1;
+}
+
+static int parse_print_format(const char **expr, print_format_t *fmt)
+{
+    const char *p = *expr;
+
+    while (*p == ' ')
+        p++;
+
+    if (*p != '/')
+        return 0;
+
+    p++;
+
+    if (!*p)
+        return -1;
+
+    switch (*p++) {
+    case 'd':
+    case 'i':
+        *fmt = PRINT_FMT_DECIMAL;
+        break;
+    case 'x':
+        *fmt = PRINT_FMT_HEX;
+        break;
+    case 'o':
+        *fmt = PRINT_FMT_OCTAL;
+        break;
+    case 't':
+        *fmt = PRINT_FMT_BINARY;
+        break;
+    case 'u':
+        *fmt = PRINT_FMT_UNSIGNED;
+        break;
+    case 'c':
+        *fmt = PRINT_FMT_CHAR;
+        break;
+    case 'a':
+        *fmt = PRINT_FMT_POINTER;
+        break;
+    default:
+        return -1;
+    }
+
+    while (*p == ' ')
+        p++;
+
+    *expr = p;
+    return 1;
+}
+
+void set_command(const char *args)
+{
+    char buf[256];
+
+    strncpy(buf, args, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    trim_line(buf);
+    args = buf;
+
+    while (*args == ' ' || *args == '\t')
+        args++;
+
+    if (!strncmp(args, "language ", 9)) {
+        args += 9;
+
+        while (*args == ' ')
+            args++;
+
+        if (!strcmp(args, "c")) {
+            print_settings.language = LANG_C;
+            printf("Language set to C.\n");
+        } else {
+            printf("unknown language (only 'c' is supported)\n");
+        }
+        return;
+    }
+
+    if (!strncmp(args, "output-radix ", 13)) {
+        args += 13;
+
+        while (*args == ' ')
+            args++;
+
+        char name[32];
+
+        if (sscanf(args, "%31s", name) != 1) {
+            printf("usage: set output-radix {8|10|16|2}\n");
+            return;
+        }
+
+        print_format_t fmt = PRINT_FMT_DEFAULT;
+
+        if (!strcmp(name, "8"))
+            fmt = PRINT_FMT_OCTAL;
+        else if (!strcmp(name, "10"))
+            fmt = PRINT_FMT_DECIMAL;
+        else if (!strcmp(name, "16"))
+            fmt = PRINT_FMT_HEX;
+        else if (!strcmp(name, "2"))
+            fmt = PRINT_FMT_BINARY;
+        else {
+            printf("unknown output radix: %s\n", name);
+            return;
+        }
+
+        print_settings.format = fmt;
+        printf("Output radix set to %s.\n", name);
+        return;
+    }
+
+    if (!strncmp(args, "print format ", 13)) {
+        args += 13;
+
+        while (*args == ' ')
+            args++;
+
+        char name[32];
+
+        if (sscanf(args, "%31s", name) != 1) {
+            printf("usage: set print format "
+                   "{decimal|hex|octal|binary|unsigned|char|pointer}\n");
+            return;
+        }
+
+        print_format_t fmt = parse_format_name(name);
+
+        if (fmt == PRINT_FMT_DEFAULT) {
+            printf("unknown print format: %s\n", name);
+            return;
+        }
+
+        print_settings.format = fmt;
+        printf("Print format set to %s.\n", format_name(fmt));
+        return;
+    }
+
+    if (!strncmp(args, "print array ", 12)) {
+        args += 12;
+
+        while (*args == ' ')
+            args++;
+
+        char name[32];
+
+        if (sscanf(args, "%31s", name) != 1) {
+            printf("usage: set print array {on|off}\n");
+            return;
+        }
+
+        int value;
+
+        if (parse_on_off(name, &value) != 0) {
+            printf("usage: set print array {on|off}\n");
+            return;
+        }
+
+        print_settings.print_array = value;
+        printf("Print array set to %s.\n", value ? "on" : "off");
+        return;
+    }
+
+    if (!strncmp(args, "print pretty ", 13)) {
+        args += 13;
+
+        while (*args == ' ')
+            args++;
+
+        char name[32];
+
+        if (sscanf(args, "%31s", name) != 1) {
+            printf("usage: set print pretty {on|off}\n");
+            return;
+        }
+
+        int value;
+
+        if (parse_on_off(name, &value) != 0) {
+            printf("usage: set print pretty {on|off}\n");
+            return;
+        }
+
+        print_settings.print_pretty = value;
+        printf("Print pretty set to %s.\n", value ? "on" : "off");
+        return;
+    }
+
+    if (!strncmp(args, "print elements ", 15)) {
+        args += 15;
+
+        while (*args == ' ')
+            args++;
+
+        char name[32];
+
+        if (sscanf(args, "%31s", name) != 1) {
+            printf("usage: set print elements {unlimited|<count>}\n");
+            return;
+        }
+
+        if (!strcmp(name, "unlimited") || !strcmp(name, "0")) {
+            print_settings.print_elements = -1;
+            printf("Print elements set to unlimited.\n");
+            return;
+        }
+
+        char *end;
+        long count = strtol(name, &end, 10);
+
+        if (*end != '\0' || count < 0) {
+            printf("usage: set print elements {unlimited|<count>}\n");
+            return;
+        }
+
+        print_settings.print_elements = (int)count;
+        printf("Print elements set to %ld.\n", count);
+        return;
+    }
+
+    if (strchr(args, '=')) {
+        if (!dbg.running) {
+            printf("no process\n");
+            return;
+        }
+
+        struct user_regs_struct regs;
+
+        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+        if (set_variable_value(args, regs.rip))
+            return;
+    }
+
+    printf("usage:\n");
+    printf("  set variable <expr> = <value>\n");
+    printf("  set <expr> = <value>\n");
+    printf("  set language c\n");
+    printf("  set output-radix {8|10|16|2}\n");
+    printf("  set print format "
+           "{decimal|hex|octal|binary|unsigned|char|pointer}\n");
+    printf("  set print array {on|off}\n");
+    printf("  set print pretty {on|off}\n");
+    printf("  set print elements {unlimited|<count>}\n");
+}
+
+void show_command(const char *args)
+{
+    char buf[256];
+
+    strncpy(buf, args, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    trim_line(buf);
+    args = buf;
+
+    while (*args == ' ' || *args == '\t')
+        args++;
+
+    if (!strcmp(args, "language") || !strcmp(args, "")) {
+        if (*args == '\0')
+            show_print_settings();
+        else
+            printf("Language: C\n");
+        return;
+    }
+
+    if (!strcmp(args, "print")) {
+        show_print_settings();
+        return;
+    }
+
+    printf("usage:\n");
+    printf("  show language\n");
+    printf("  show print\n");
+}
+
+void print_expression(const char *expr)
+{
+    if (!dbg.running) {
+        printf("no process\n");
+        return;
+    }
+
+    if (print_settings.language != LANG_C) {
+        printf("only C language is supported\n");
+        return;
+    }
+
+    while (*expr == ' ' || *expr == '\t')
+        expr++;
+
+    char buf[256];
+    strncpy(buf, expr, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    size_t len = strlen(buf);
+
+    if (len > 0 && buf[len - 1] == '\n')
+        buf[len - 1] = '\0';
+
+    const char *p = buf;
+    print_format_t fmt = PRINT_FMT_DEFAULT;
+    int pf = parse_print_format(&p, &fmt);
+
+    if (pf < 0) {
+        printf("unknown print format\n");
+        return;
+    }
+
+    struct user_regs_struct regs;
+
+    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+    eval_result_t res;
+
+    if (eval_expression(p, regs.rip, &res) != 0)
+        return;
+
+    print_eval_result(&res, fmt);
 }
 
 #define DW_LNS_extended_op      0x00
@@ -1008,6 +2494,8 @@ int lookup_line(unsigned long addr, const char **file, int *line)
     if (line_entry_count == 0)
         return -1;
 
+    addr = to_debug_addr(addr);
+
     if (addr < line_addr_min || addr > line_addr_max)
         return -1;
 
@@ -1054,6 +2542,83 @@ static int file_matches(const char *entry_file, const char *query)
         return 1;
 
     return 0;
+}
+
+static unsigned long to_debug_addr(unsigned long addr)
+{
+    if (dbg.is_pie && dbg.load_base != 0 && addr >= dbg.load_base)
+        return addr - dbg.load_base;
+
+    return addr;
+}
+
+static unsigned long to_runtime_addr(unsigned long addr)
+{
+    if (dbg.is_pie && dbg.load_base != 0 && addr < dbg.load_base)
+        return addr + dbg.load_base;
+
+    return addr;
+}
+
+static int map_path_matches_debuggee(const char *path)
+{
+    if (!path || !path[0])
+        return 0;
+
+    if (!strcmp(path, debuggee_realpath))
+        return 1;
+
+    if (!strcmp(file_basename(path), file_basename(debuggee_realpath)))
+        return 1;
+
+    return 0;
+}
+
+static int update_load_base(void)
+{
+    dbg.load_base = 0;
+
+    if (!dbg.is_pie)
+        return 0;
+
+    char maps_path[64];
+
+    snprintf(maps_path, sizeof(maps_path),
+             "/proc/%d/maps", dbg.pid);
+
+    FILE *fp = fopen(maps_path, "r");
+
+    if (!fp) {
+        perror("fopen maps");
+        return -1;
+    }
+
+    char line[1024];
+
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long start;
+        unsigned long end;
+        unsigned long offset;
+        char perms[5] = {0};
+        char path[512] = {0};
+
+        int n = sscanf(line,
+                       "%lx-%lx %4s %lx %*s %*s %511s",
+                       &start, &end, perms, &offset, path);
+
+        if (n < 4)
+            continue;
+
+        if (n == 5 && strchr(perms, 'x') &&
+            map_path_matches_debuggee(path)) {
+            dbg.load_base = start - offset;
+            fclose(fp);
+            return 0;
+        }
+    }
+
+    fclose(fp);
+    return -1;
 }
 
 int lookup_line_addr(const char *file, int line, unsigned long *addr)
@@ -1118,6 +2683,8 @@ int get_return_address(unsigned long *ret_addr);
 
 static unsigned long current_func_start(unsigned long rip)
 {
+    rip = to_debug_addr(rip);
+
     unsigned long start = 0;
 
     for (int i = 0; i < sym_count; i++) {
@@ -1156,12 +2723,13 @@ int lookup_next_line_scoped(unsigned long rip,
                             int *next_line,
                             unsigned long *addr)
 {
+    unsigned long debug_rip = to_debug_addr(rip);
     unsigned long func_end = current_func_end(rip);
     unsigned long best = 0;
     int best_line = 0;
 
     for (int i = 0; i < line_entry_count; i++) {
-        if (line_entries[i].addr <= rip)
+        if (line_entries[i].addr <= debug_rip)
             continue;
 
         if (line_entries[i].addr >= func_end)
@@ -1183,7 +2751,7 @@ int lookup_next_line_scoped(unsigned long rip,
     }
 
     if (best != 0) {
-        *addr = best;
+        *addr = to_runtime_addr(best);
         *next_line = best_line;
         return 0;
     }
@@ -1361,6 +2929,59 @@ void list_source(const char *arg)
     printf("unknown source location: %s\n", item);
 }
 
+static void show_disassembly_line(unsigned long addr)
+{
+    if (debuggee_path[0] == '\0') {
+        printf("=> 0x%lx\n", addr);
+        return;
+    }
+
+    unsigned long debug_addr = to_debug_addr(addr);
+    char cmd[1024];
+
+    snprintf(cmd, sizeof(cmd),
+             "objdump -d --start-address=0x%lx "
+             "--stop-address=0x%lx '%s'",
+             debug_addr, debug_addr + 16, debuggee_path);
+
+    FILE *fp = popen(cmd, "r");
+
+    if (!fp) {
+        perror("popen");
+        return;
+    }
+
+    char buf[1024];
+
+    while (fgets(buf, sizeof(buf), fp)) {
+        char *p = buf;
+
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        char *end;
+        unsigned long insn_addr = strtoul(p, &end, 16);
+
+        if (end == p || *end != ':')
+            continue;
+
+        char *text = end + 1;
+        size_t len = strlen(text);
+
+        if (len > 0 && text[len - 1] == '\n')
+            text[len - 1] = '\0';
+
+        printf("=> 0x%lx:%s\n",
+               to_runtime_addr(insn_addr),
+               text);
+        pclose(fp);
+        return;
+    }
+
+    pclose(fp);
+    printf("=> 0x%lx: (no source)\n", addr);
+}
+
 void show_pc_location(unsigned long rip)
 {
     const char *file;
@@ -1369,6 +2990,8 @@ void show_pc_location(unsigned long rip)
     if (lookup_line(rip, &file, &line) == 0) {
         printf("=> %s:%d\n", file, line);
         show_source_listing(file, line);
+    } else {
+        show_disassembly_line(rip);
     }
 }
 
@@ -1406,6 +3029,8 @@ void load_symbols(char *path)
         munmap(map, st.st_size);
         return;
     }
+
+    dbg.is_pie = (ehdr->e_type == ET_DYN);
 
     Elf64_Shdr *shdrs =
         (Elf64_Shdr *)((char *)map + ehdr->e_shoff);
@@ -1531,6 +3156,8 @@ static const symbol_t *lookup_function_symbol(unsigned long addr)
 {
     const symbol_t *best = NULL;
 
+    addr = to_debug_addr(addr);
+
     for (int i = 0; i < sym_count; i++) {
         if (symbols[i].type != STT_FUNC)
             continue;
@@ -1559,6 +3186,9 @@ static void disassemble_range(unsigned long start, unsigned long end)
         printf("no program loaded (use run first)\n");
         return;
     }
+
+    start = to_debug_addr(start);
+    end = to_debug_addr(end);
 
     if (end <= start)
         end = start + 64;
@@ -1720,6 +3350,9 @@ static int wait_for_exec(pid_t pid)
 
 void run_target(char *program)
 {
+    dbg.is_pie = 0;
+    dbg.load_base = 0;
+
     pid_t pid = fork();
 
     if (pid == 0) {
@@ -1743,12 +3376,24 @@ void run_target(char *program)
     strncpy(debuggee_path, program, sizeof(debuggee_path) - 1);
     debuggee_path[sizeof(debuggee_path) - 1] = '\0';
 
+    if (!realpath(program, debuggee_realpath)) {
+        strncpy(debuggee_realpath, program,
+                sizeof(debuggee_realpath) - 1);
+        debuggee_realpath[sizeof(debuggee_realpath) - 1] = '\0';
+    }
+
     load_symbols(program);
     load_line_table(program);
     load_variables(program);
 
     if (wait_for_exec(pid) != 0) {
         printf("[-] failed to start target\n");
+        dbg.running = 0;
+        return;
+    }
+
+    if (update_load_base() != 0) {
+        printf("[-] failed to read load base\n");
         dbg.running = 0;
         return;
     }
@@ -1819,6 +3464,7 @@ static int peek_word(unsigned long addr, unsigned long *value)
 static void print_backtrace_frame(int frame, unsigned long addr)
 {
     const symbol_t *sym = lookup_function_symbol(addr);
+    unsigned long debug_addr = to_debug_addr(addr);
     const char *file;
     int line;
 
@@ -1826,8 +3472,8 @@ static void print_backtrace_frame(int frame, unsigned long addr)
 
     if (sym) {
         printf(" in %s", sym->name);
-        if (addr >= sym->addr)
-            printf("+0x%lx", addr - sym->addr);
+        if (debug_addr >= sym->addr)
+            printf("+0x%lx", debug_addr - sym->addr);
     }
 
     if (lookup_line(addr, &file, &line) == 0)
@@ -1926,6 +3572,70 @@ void single_step()
     }
 }
 
+void source_step()
+{
+    if (!dbg.running) {
+        printf("no process\n");
+        return;
+    }
+
+    struct user_regs_struct regs;
+    const char *start_file;
+    int start_line;
+
+    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+    if (lookup_line(regs.rip, &start_file, &start_line) != 0) {
+        single_step();
+        return;
+    }
+
+    for (int i = 0; i < 10000; i++) {
+        if (ptrace(PTRACE_SINGLESTEP,
+                   dbg.pid,
+                   0,
+                   0) == -1) {
+            perror("ptrace singlestep");
+            return;
+        }
+
+        int status;
+
+        if (waitpid(dbg.pid, &status, 0) < 0) {
+            perror("waitpid");
+            return;
+        }
+
+        if (WIFEXITED(status)) {
+            printf("[+] process exited\n");
+            dbg.running = 0;
+            return;
+        }
+
+        if (!WIFSTOPPED(status))
+            continue;
+
+        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+        const char *file;
+        int line;
+
+        if (lookup_line(regs.rip, &file, &line) != 0) {
+            printf("[+] stepped\n");
+            show_pc_location(regs.rip);
+            return;
+        }
+
+        if (line != start_line || strcmp(file, start_file)) {
+            printf("[+] stepped\n");
+            show_pc_location(regs.rip);
+            return;
+        }
+    }
+
+    printf("source step limit reached\n");
+}
+
 breakpoint_t* find_breakpoint(unsigned long addr)
 {
     for (int i = 0; i < bp_count; i++) {
@@ -1946,6 +3656,8 @@ void set_breakpoint(unsigned long addr)
         printf("no process\n");
         return;
     }
+
+    addr = to_runtime_addr(addr);
 
     if (bp_count >= MAX_BREAKPOINTS) {
         printf("too many breakpoints\n");
@@ -2012,27 +3724,37 @@ breakpoint_t* find_breakpoint_by_rip(unsigned long rip)
     return find_breakpoint(rip - 1);
 }
 
-void restore_breakpoint(breakpoint_t *bp)
+int restore_breakpoint(breakpoint_t *bp)
 {
-    ptrace(
-        PTRACE_POKEDATA,
-        dbg.pid,
-        (void*)bp->addr,
-        (void*)bp->original_data
-    );
+    if (ptrace(
+            PTRACE_POKEDATA,
+            dbg.pid,
+            (void*)bp->addr,
+            (void*)bp->original_data
+        ) == -1) {
+        perror("ptrace restore breakpoint");
+        return -1;
+    }
+
+    return 0;
 }
 
-void enable_breakpoint(breakpoint_t *bp)
+int enable_breakpoint(breakpoint_t *bp)
 {
     long patched =
         (bp->original_data & ~0xff) | 0xcc;
 
-    ptrace(
-        PTRACE_POKEDATA,
-        dbg.pid,
-        (void*)bp->addr,
-        (void*)patched
-    );
+    if (ptrace(
+            PTRACE_POKEDATA,
+            dbg.pid,
+            (void*)bp->addr,
+            (void*)patched
+        ) == -1) {
+        perror("ptrace enable breakpoint");
+        return -1;
+    }
+
+    return 0;
 }
 
 void rewind_rip(unsigned long addr)
@@ -2056,13 +3778,14 @@ void rewind_rip(unsigned long addr)
     );
 }
 
-void step_over_breakpoint(breakpoint_t *bp)
+int step_over_breakpoint(breakpoint_t *bp)
 {
     /*
       restore original instruction
     */
 
-    restore_breakpoint(bp);
+    if (restore_breakpoint(bp) != 0)
+        return -1;
 
     /*
       RIP = original address
@@ -2074,24 +3797,41 @@ void step_over_breakpoint(breakpoint_t *bp)
       execute 1 instruction
     */
 
-    ptrace(
-        PTRACE_SINGLESTEP,
-        dbg.pid,
-        0,
-        0
-    );
+    if (ptrace(
+            PTRACE_SINGLESTEP,
+            dbg.pid,
+            0,
+            0
+        ) == -1) {
+        perror("ptrace singlestep");
+        return -1;
+    }
 
-    waitpid(
-        dbg.pid,
-        NULL,
-        0
-    );
+    int status;
+
+    if (waitpid(
+            dbg.pid,
+            &status,
+            0
+        ) < 0) {
+        perror("waitpid");
+        return -1;
+    }
+
+    if (WIFEXITED(status)) {
+        printf("[+] process exited\n");
+        dbg.running = 0;
+        return -1;
+    }
 
     /*
       put INT3 back
     */
 
-    enable_breakpoint(bp);
+    if (enable_breakpoint(bp) != 0)
+        return -1;
+
+    return 0;
 }
 
 static int arm_temp_breakpoint(finish_bp_t *tp, unsigned long addr)
@@ -2189,11 +3929,12 @@ int get_return_address(unsigned long *ret_addr)
 
     ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
 
+    unsigned long debug_rip = to_debug_addr(regs.rip);
     unsigned long func_start = 0;
 
     for (int i = 0; i < sym_count; i++) {
         if (symbols[i].type == STT_FUNC &&
-            symbols[i].addr <= regs.rip &&
+            symbols[i].addr <= debug_rip &&
             symbols[i].addr >= func_start) {
             func_start = symbols[i].addr;
         }
@@ -2216,12 +3957,14 @@ int get_return_address(unsigned long *ret_addr)
 
     for (int i = 0; i < count; i++) {
         unsigned long addr = candidates[i];
+        unsigned long debug_addr = to_debug_addr(addr);
 
         if (line_entry_count > 0 &&
-            (addr < line_addr_min || addr > line_addr_max))
+            (debug_addr < line_addr_min ||
+             debug_addr > line_addr_max))
             continue;
 
-        if (addr > func_start && addr != regs.rip) {
+        if (debug_addr > func_start && debug_addr != debug_rip) {
             *ret_addr = addr;
             return 0;
         }
@@ -2381,7 +4124,8 @@ void continue_execution()
                 );
                 show_pc_location(bp->addr);
 
-                step_over_breakpoint(bp);
+                if (step_over_breakpoint(bp) != 0)
+                    printf("[-] failed to re-enable breakpoint\n");
 
                 return;
             }
@@ -2415,6 +4159,10 @@ void handle(char *line)
     }
 
     else if (!strcmp(line, "s\n")) {
+        source_step();
+    }
+
+    else if (!strcmp(line, "si\n")) {
         single_step();
     }
 
@@ -2452,20 +4200,23 @@ void handle(char *line)
         disassemble_command(line + 4);
     }
 
-    else if (!strncmp(line, "p ", 2)) {
-
-        char name[256];
-
-        if (sscanf(line + 2, "%255s", name) == 1)
-            print_variable(name);
+    else if (!strncmp(line, "p ", 2) ||
+             !strcmp(line, "p\n")) {
+        print_expression(line + 2);
     }
 
-    else if (!strncmp(line, "print ", 6)) {
+    else if (!strncmp(line, "print ", 6) ||
+             !strcmp(line, "print\n")) {
+        print_expression(line + 6);
+    }
 
-        char name[256];
+    else if (!strncmp(line, "set ", 4)) {
+        set_command(line + 4);
+    }
 
-        if (sscanf(line + 6, "%255s", name) == 1)
-            print_variable(name);
+    else if (!strncmp(line, "show ", 5) ||
+             !strcmp(line, "show\n")) {
+        show_command(line + 5);
     }
 
     else if (!strncmp(line, "x ", 2)) {
