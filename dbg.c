@@ -1533,11 +1533,661 @@ static void print_eval_result(const eval_result_t *res, print_format_t fmt)
     print_value(res->label, val, fmt);
 }
 
+typedef struct {
+    const char *cur;
+    unsigned long rip;
+} ep_t;
+
+typedef struct {
+    long value;
+    int has_lval;
+    eval_result_t lval;
+} c_expr_t;
+
+static int ep_is_ident_start(char c)
+{
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static int ep_is_binop_at(const char *p)
+{
+    p = skip_spaces(p);
+
+    if (*p == '\0' || *p == ')' || *p == ']' || *p == '=')
+        return 0;
+
+    if (*p == '-' && p[1] == '>')
+        return 0;
+
+    if (!strncmp(p, "||", 2) || !strncmp(p, "&&", 2) ||
+        !strncmp(p, "==", 2) || !strncmp(p, "!=", 2) ||
+        !strncmp(p, "<=", 2) || !strncmp(p, ">=", 2) ||
+        !strncmp(p, "<<", 2) || !strncmp(p, ">>", 2))
+        return 1;
+
+    return strchr("+-*/%&|^<>!", *p) != NULL;
+}
+
+static int ep_is_aggregate_lval(const eval_result_t *res)
+{
+    type_info_t ti;
+
+    if (!res->type_off || get_cached_type(res->type_off, &ti) != 0)
+        return 0;
+
+    resolve_type_alias(&ti, NULL);
+
+    return ti.kind == TYPE_STRUCT || ti.kind == TYPE_ARRAY;
+}
+
+static int ep_load_scalar(c_expr_t *out)
+{
+    if (!out->has_lval)
+        return 0;
+
+    if (ep_is_aggregate_lval(&out->lval))
+        return 0;
+
+    type_info_t ti = {
+        .kind = TYPE_BASE,
+        .size = 4,
+        .encoding = DW_ATE_signed,
+    };
+
+    if (out->lval.type_off != 0)
+        get_cached_type(out->lval.type_off, &ti);
+
+    unsigned long uval;
+
+    if (read_typed_value(out->lval.addr, &ti, &uval) != 0)
+        return -1;
+
+    out->value = (long)uval;
+    return 0;
+}
+
+static int ep_parse_or(ep_t *ep, c_expr_t *out);
+static int ep_parse_primary(ep_t *ep, c_expr_t *out);
+static int ep_parse_unary(ep_t *ep, c_expr_t *out);
+static int ep_parse_mul(ep_t *ep, c_expr_t *out);
+static int ep_parse_add(ep_t *ep, c_expr_t *out);
+static int ep_parse_shift(ep_t *ep, c_expr_t *out);
+static int ep_parse_rel(ep_t *ep, c_expr_t *out);
+static int ep_parse_eq(ep_t *ep, c_expr_t *out);
+static int ep_parse_bitand(ep_t *ep, c_expr_t *out);
+static int ep_parse_bitxor(ep_t *ep, c_expr_t *out);
+static int ep_parse_bitor(ep_t *ep, c_expr_t *out);
+static int ep_parse_and(ep_t *ep, c_expr_t *out);
+
+static int ep_parse_postfix(ep_t *ep, eval_result_t *res, int stop_at_binop)
+{
+    for (;;) {
+        ep->cur = skip_spaces(ep->cur);
+
+        if (stop_at_binop && ep_is_binop_at(ep->cur))
+            break;
+
+        if (*ep->cur == '.') {
+            char member[64];
+
+            ep->cur = parse_c_ident(ep->cur + 1, member, sizeof(member));
+
+            if (!ep->cur || !member[0]) {
+                printf("expected member name after '.'\n");
+                return -1;
+            }
+
+            if (apply_member(res, member) != 0)
+                return -1;
+        } else if (*ep->cur == '-' && ep->cur[1] == '>') {
+            char base_label[256];
+            char member[64];
+
+            strncpy(base_label, res->label, sizeof(base_label) - 1);
+            base_label[sizeof(base_label) - 1] = '\0';
+
+            if (apply_deref(res, 0) != 0)
+                return -1;
+
+            ep->cur += 2;
+            ep->cur = skip_spaces(ep->cur);
+            ep->cur = parse_c_ident(ep->cur, member, sizeof(member));
+
+            if (!ep->cur || !member[0]) {
+                printf("expected member name after '->'\n");
+                return -1;
+            }
+
+            if (resolve_member(res, member) != 0)
+                return -1;
+
+            strncpy(res->label, base_label, sizeof(res->label) - 1);
+            res->label[sizeof(res->label) - 1] = '\0';
+            append_label(res->label, sizeof(res->label), "->");
+            append_label(res->label, sizeof(res->label), member);
+        } else if (*ep->cur == '[') {
+            c_expr_t idx;
+
+            ep->cur = skip_spaces(ep->cur + 1);
+
+            if (ep_parse_or(ep, &idx) != 0)
+                return -1;
+
+            ep->cur = skip_spaces(ep->cur);
+
+            if (*ep->cur != ']') {
+                printf("expected ']'\n");
+                return -1;
+            }
+
+            ep->cur++;
+
+            if (apply_index(res, idx.value) != 0)
+                return -1;
+        } else {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static int ep_require_scalar(c_expr_t *n)
+{
+    if (n->has_lval && ep_is_aggregate_lval(&n->lval)) {
+        printf("aggregate value in expression: %s\n", n->lval.label);
+        return -1;
+    }
+
+    if (n->has_lval && ep_load_scalar(n) != 0)
+        return -1;
+
+    n->has_lval = 0;
+    return 0;
+}
+
+static int ep_parse_primary(ep_t *ep, c_expr_t *out)
+{
+    ep->cur = skip_spaces(ep->cur);
+
+    if (*ep->cur == '(') {
+        ep->cur++;
+        if (ep_parse_or(ep, out) != 0)
+            return -1;
+
+        ep->cur = skip_spaces(ep->cur);
+
+        if (*ep->cur != ')') {
+            printf("expected ')'\n");
+            return -1;
+        }
+
+        ep->cur++;
+        return 0;
+    }
+
+    if ((*ep->cur >= '0' && *ep->cur <= '9') ||
+        ((*ep->cur == '0' || *ep->cur == '-') &&
+         ep->cur[1] == 'x') ||
+        (*ep->cur == '0' && ep->cur[1] >= '0' && ep->cur[1] <= '7')) {
+        char *end;
+        unsigned long uval = strtoul(ep->cur, &end, 0);
+
+        if (end == ep->cur) {
+            printf("invalid number\n");
+            return -1;
+        }
+
+        ep->cur = end;
+        out->value = (long)uval;
+        out->has_lval = 0;
+        return 0;
+    }
+
+    if (!ep_is_ident_start(*ep->cur)) {
+        printf("syntax error near '%s'\n", ep->cur);
+        return -1;
+    }
+
+    char name[64];
+
+    ep->cur = parse_c_ident(ep->cur, name, sizeof(name));
+
+    if (!name[0]) {
+        printf("expected identifier\n");
+        return -1;
+    }
+
+    eval_result_t res;
+
+    if (read_var_addr(name, ep->rip, &res.addr, &res.type_off) != 0) {
+        printf("unknown variable: %s\n", name);
+        return -1;
+    }
+
+    strncpy(res.label, name, sizeof(res.label) - 1);
+    res.label[sizeof(res.label) - 1] = '\0';
+
+    if (ep_parse_postfix(ep, &res, 0) != 0)
+        return -1;
+
+    out->has_lval = 1;
+    out->lval = res;
+    return ep_load_scalar(out);
+}
+
+static int ep_parse_unary(ep_t *ep, c_expr_t *out)
+{
+    ep->cur = skip_spaces(ep->cur);
+
+    if (*ep->cur == '+') {
+        ep->cur++;
+        if (ep_parse_unary(ep, out) != 0)
+            return -1;
+        return ep_require_scalar(out);
+    }
+
+    if (*ep->cur == '-') {
+        ep->cur++;
+        if (ep_parse_unary(ep, out) != 0)
+            return -1;
+        if (ep_require_scalar(out) != 0)
+            return -1;
+        out->value = -out->value;
+        return 0;
+    }
+
+    if (*ep->cur == '~') {
+        ep->cur++;
+        if (ep_parse_unary(ep, out) != 0)
+            return -1;
+        if (ep_require_scalar(out) != 0)
+            return -1;
+        out->value = ~out->value;
+        return 0;
+    }
+
+    if (*ep->cur == '!') {
+        ep->cur++;
+        if (ep_parse_unary(ep, out) != 0)
+            return -1;
+        if (ep_require_scalar(out) != 0)
+            return -1;
+        out->value = !out->value;
+        return 0;
+    }
+
+    if (*ep->cur == '*') {
+        ep->cur++;
+        if (ep_parse_unary(ep, out) != 0)
+            return -1;
+
+        if (!out->has_lval) {
+            printf("invalid dereference\n");
+            return -1;
+        }
+
+        if (apply_deref(&out->lval, 1) != 0)
+            return -1;
+
+        return ep_load_scalar(out);
+    }
+
+    return ep_parse_primary(ep, out);
+}
+
+static int ep_parse_mul(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_unary(ep, out) != 0)
+        return -1;
+
+    for (;;) {
+        ep->cur = skip_spaces(ep->cur);
+
+        char op = *ep->cur;
+
+        if (op != '*' && op != '/' && op != '%')
+            break;
+
+        ep->cur++;
+
+        c_expr_t rhs;
+
+        if (ep_parse_unary(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        if (op == '*')
+            out->value *= rhs.value;
+        else if (op == '/') {
+            if (rhs.value == 0) {
+                printf("division by zero\n");
+                return -1;
+            }
+            out->value /= rhs.value;
+        } else {
+            if (rhs.value == 0) {
+                printf("division by zero\n");
+                return -1;
+            }
+            out->value %= rhs.value;
+        }
+    }
+
+    return 0;
+}
+
+static int ep_parse_add(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_mul(ep, out) != 0)
+        return -1;
+
+    for (;;) {
+        ep->cur = skip_spaces(ep->cur);
+
+        char op = *ep->cur;
+
+        if (op != '+' && op != '-')
+            break;
+
+        ep->cur++;
+
+        c_expr_t rhs;
+
+        if (ep_parse_mul(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        if (op == '+')
+            out->value += rhs.value;
+        else
+            out->value -= rhs.value;
+    }
+
+    return 0;
+}
+
+static int ep_parse_shift(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_add(ep, out) != 0)
+        return -1;
+
+    for (;;) {
+        ep->cur = skip_spaces(ep->cur);
+
+        int is_left;
+
+        if (!strncmp(ep->cur, "<<", 2)) {
+            ep->cur += 2;
+            is_left = 1;
+        } else if (!strncmp(ep->cur, ">>", 2)) {
+            ep->cur += 2;
+            is_left = 0;
+        } else {
+            break;
+        }
+
+        c_expr_t rhs;
+
+        if (ep_parse_add(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        if (is_left)
+            out->value = (long)((unsigned long)out->value <<
+                                (unsigned)(rhs.value & 63));
+        else
+            out->value = (long)((unsigned long)out->value >>
+                                (unsigned)(rhs.value & 63));
+    }
+
+    return 0;
+}
+
+static int ep_parse_rel(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_shift(ep, out) != 0)
+        return -1;
+
+    for (;;) {
+        ep->cur = skip_spaces(ep->cur);
+
+        int op = 0;
+
+        if (!strncmp(ep->cur, "<=", 2)) {
+            op = 1;
+            ep->cur += 2;
+        } else if (!strncmp(ep->cur, ">=", 2)) {
+            op = 2;
+            ep->cur += 2;
+        } else if (*ep->cur == '<') {
+            op = 3;
+            ep->cur++;
+        } else if (*ep->cur == '>') {
+            op = 4;
+            ep->cur++;
+        } else {
+            break;
+        }
+
+        c_expr_t rhs;
+
+        if (ep_parse_shift(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        switch (op) {
+        case 1:
+            out->value = out->value <= rhs.value;
+            break;
+        case 2:
+            out->value = out->value >= rhs.value;
+            break;
+        case 3:
+            out->value = out->value < rhs.value;
+            break;
+        case 4:
+            out->value = out->value > rhs.value;
+            break;
+        }
+
+        out->value = out->value ? 1 : 0;
+    }
+
+    return 0;
+}
+
+static int ep_parse_eq(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_rel(ep, out) != 0)
+        return -1;
+
+    for (;;) {
+        ep->cur = skip_spaces(ep->cur);
+
+        int op = 0;
+
+        if (!strncmp(ep->cur, "==", 2)) {
+            op = 1;
+            ep->cur += 2;
+        } else if (!strncmp(ep->cur, "!=", 2)) {
+            op = 2;
+            ep->cur += 2;
+        } else {
+            break;
+        }
+
+        c_expr_t rhs;
+
+        if (ep_parse_rel(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        if (op == 1)
+            out->value = out->value == rhs.value;
+        else
+            out->value = out->value != rhs.value;
+
+        out->value = out->value ? 1 : 0;
+    }
+
+    return 0;
+}
+
+static int ep_parse_bitand(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_eq(ep, out) != 0)
+        return -1;
+
+    while (*skip_spaces(ep->cur) == '&' && ep->cur[1] != '&') {
+        ep->cur = skip_spaces(ep->cur) + 1;
+
+        c_expr_t rhs;
+
+        if (ep_parse_eq(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        out->value = (long)((unsigned long)out->value &
+                            (unsigned long)rhs.value);
+    }
+
+    return 0;
+}
+
+static int ep_parse_bitxor(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_bitand(ep, out) != 0)
+        return -1;
+
+    while (*skip_spaces(ep->cur) == '^') {
+        ep->cur = skip_spaces(ep->cur) + 1;
+
+        c_expr_t rhs;
+
+        if (ep_parse_bitand(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        out->value = (long)((unsigned long)out->value ^
+                            (unsigned long)rhs.value);
+    }
+
+    return 0;
+}
+
+static int ep_parse_bitor(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_bitxor(ep, out) != 0)
+        return -1;
+
+    while (*skip_spaces(ep->cur) == '|' && ep->cur[1] != '|') {
+        ep->cur = skip_spaces(ep->cur) + 1;
+
+        c_expr_t rhs;
+
+        if (ep_parse_bitxor(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        out->value = (long)((unsigned long)out->value |
+                            (unsigned long)rhs.value);
+    }
+
+    return 0;
+}
+
+static int ep_parse_and(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_bitor(ep, out) != 0)
+        return -1;
+
+    while (!strncmp(skip_spaces(ep->cur), "&&", 2)) {
+        ep->cur = skip_spaces(ep->cur) + 2;
+
+        c_expr_t rhs;
+
+        if (ep_parse_bitor(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        out->value = out->value && rhs.value ? 1 : 0;
+    }
+
+    return 0;
+}
+
+static int ep_parse_or(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_and(ep, out) != 0)
+        return -1;
+
+    while (!strncmp(skip_spaces(ep->cur), "||", 2)) {
+        ep->cur = skip_spaces(ep->cur) + 2;
+
+        c_expr_t rhs;
+
+        if (ep_parse_and(ep, &rhs) != 0)
+            return -1;
+
+        if (ep_require_scalar(out) != 0 || ep_require_scalar(&rhs) != 0)
+            return -1;
+
+        out->value = out->value || rhs.value ? 1 : 0;
+    }
+
+    ep->cur = skip_spaces(ep->cur);
+    return 0;
+}
+
+static int ep_parse_expr(ep_t *ep, c_expr_t *out)
+{
+    if (ep_parse_or(ep, out) != 0)
+        return -1;
+
+    if (*ep->cur != '\0') {
+        printf("syntax error near '%s'\n", ep->cur);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void print_c_expr(c_expr_t *node, const char *label, print_format_t fmt)
+{
+    if (node->has_lval && ep_is_aggregate_lval(&node->lval)) {
+        print_eval_result(&node->lval, fmt);
+        return;
+    }
+
+    print_value(label, (unsigned long)node->value, fmt);
+}
+
 static int eval_lvalue(const char *expr,
                        unsigned long rip,
                        eval_result_t *res)
 {
-    const char *p = skip_spaces(expr);
+    ep_t ep = { .cur = expr, .rip = rip };
+    const char *p = skip_spaces(ep.cur);
     int deref = 0;
 
     while (*p == '*') {
@@ -1560,69 +2210,19 @@ static int eval_lvalue(const char *expr,
     strncpy(res->label, name, sizeof(res->label) - 1);
     res->label[sizeof(res->label) - 1] = '\0';
 
+    ep.cur = p;
+
     if (deref && apply_deref(res, 1) != 0)
         return -1;
 
-    p = skip_spaces(p);
+    if (ep_parse_postfix(&ep, res, 1) != 0)
+        return -1;
 
-    while (*p) {
-        if (*p == '.') {
-            char member[64];
+    ep.cur = skip_spaces(ep.cur);
 
-            p = parse_c_ident(p + 1, member, sizeof(member));
-
-            if (!p || !member[0]) {
-                printf("expected member name after '.'\n");
-                return -1;
-            }
-
-            if (apply_member(res, member) != 0)
-                return -1;
-        } else if (*p == '-' && p[1] == '>') {
-            char base_label[256];
-            char member[64];
-
-            strncpy(base_label, res->label, sizeof(base_label) - 1);
-            base_label[sizeof(base_label) - 1] = '\0';
-
-            if (apply_deref(res, 0) != 0)
-                return -1;
-
-            p += 2;
-            p = skip_spaces(p);
-            p = parse_c_ident(p, member, sizeof(member));
-
-            if (!p || !member[0]) {
-                printf("expected member name after '->'\n");
-                return -1;
-            }
-
-            if (resolve_member(res, member) != 0)
-                return -1;
-
-            strncpy(res->label, base_label, sizeof(res->label) - 1);
-            res->label[sizeof(res->label) - 1] = '\0';
-            append_label(res->label, sizeof(res->label), "->");
-            append_label(res->label, sizeof(res->label), member);
-        } else if (*p == '[') {
-            char *end;
-            long index = strtol(p + 1, &end, 10);
-
-            if (end == p + 1 || *end != ']') {
-                printf("invalid array index\n");
-                return -1;
-            }
-
-            if (apply_index(res, index) != 0)
-                return -1;
-
-            p = end + 1;
-        } else {
-            printf("syntax error near '%s'\n", p);
-            return -1;
-        }
-
-        p = skip_spaces(p);
+    if (*ep.cur != '\0') {
+        printf("not an lvalue: %s\n", expr);
+        return -1;
     }
 
     return 0;
@@ -1630,15 +2230,11 @@ static int eval_lvalue(const char *expr,
 
 static int eval_expression(const char *expr,
                            unsigned long rip,
-                           eval_result_t *res)
+                           c_expr_t *out)
 {
-    if (eval_lvalue(expr, rip, res) != 0) {
-        if (!*skip_spaces(expr))
-            printf("usage: print [/format] expr\n");
-        return -1;
-    }
+    ep_t ep = { .cur = expr, .rip = rip };
 
-    return 0;
+    return ep_parse_expr(&ep, out);
 }
 
 static int set_variable_value(const char *args, unsigned long rip)
@@ -1680,16 +2276,11 @@ static int set_variable_value(const char *args, unsigned long rip)
     if (eval_lvalue(lhs, rip, &res) != 0)
         return 1;
 
-    char *end;
-    unsigned long val = strtoul(rhs, &end, 0);
+    ep_t ep = { .cur = rhs, .rip = rip };
+    c_expr_t val;
 
-    while (*end == ' ' || *end == '\t')
-        end++;
-
-    if (end == (char *)rhs || *end != '\0') {
-        printf("invalid value: %s\n", rhs);
+    if (ep_parse_expr(&ep, &val) != 0)
         return 1;
-    }
 
     type_info_t ti = {
         .kind = TYPE_BASE,
@@ -1703,7 +2294,7 @@ static int set_variable_value(const char *args, unsigned long rip)
         return 1;
     }
 
-    if (write_typed_value(res.addr, &ti, val) != 0)
+    if (write_typed_value(res.addr, &ti, (unsigned long)val.value) != 0)
         return 1;
 
     print_eval_result(&res, PRINT_FMT_DEFAULT);
@@ -2020,12 +2611,15 @@ void print_expression(const char *expr)
 
     ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
 
-    eval_result_t res;
+    c_expr_t node;
 
-    if (eval_expression(p, regs.rip, &res) != 0)
+    if (eval_expression(p, regs.rip, &node) != 0) {
+        if (!*skip_spaces(p))
+            printf("usage: print [/format] expr\n");
         return;
+    }
 
-    print_eval_result(&res, fmt);
+    print_c_expr(&node, p, fmt);
 }
 
 #define DW_LNS_extended_op      0x00
