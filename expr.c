@@ -271,6 +271,17 @@ static void print_type_annotation(uint32_t type_off)
         printf("(%s) ", buf);
 }
 
+static int is_pointer_type(uint32_t type_off)
+{
+    type_info_t ti;
+
+    if (type_off == 0 || get_cached_type(type_off, &ti) != 0)
+        return 0;
+
+    resolve_type_alias(&ti, NULL);
+    return ti.kind == TYPE_POINTER;
+}
+
 static void print_value(const char *label,
                         unsigned long value,
                         print_format_t fmt,
@@ -281,8 +292,13 @@ static void print_value(const char *label,
 
     print_type_annotation(type_off);
 
-    if (fmt == PRINT_FMT_DEFAULT)
+    int fmt_default = (fmt == PRINT_FMT_DEFAULT);
+
+    if (fmt_default)
         fmt = print_settings.format;
+
+    if (fmt_default && is_pointer_type(type_off))
+        fmt = PRINT_FMT_HEX;
 
     switch (fmt) {
     case PRINT_FMT_HEX:
@@ -324,7 +340,7 @@ static void print_value(const char *label,
         print_string_value("", value);
         break;
     case PRINT_FMT_POINTER:
-        printf("%p\n", (void *)value);
+        printf("0x%lx\n", value);
         break;
     case PRINT_FMT_DECIMAL:
     default:
@@ -625,7 +641,7 @@ static void print_struct_members_inline(unsigned long addr,
             printf("%s = ", ti->members[i].name);
 
             if (mt.kind == TYPE_POINTER)
-                printf("%p", (void *)mval);
+                printf("0x%lx", mval);
             else if (mt.encoding == DW_ATE_unsigned)
                 printf("%lu", mval);
             else
@@ -743,7 +759,7 @@ static void print_array_value(const char *label,
                 print_type_annotation(ti->elem_type_off);
 
             if (elem.kind == TYPE_POINTER)
-                printf("%p", (void *)val);
+                printf("0x%lx", val);
             else if (elem.encoding == DW_ATE_unsigned)
                 printf("%lu", val);
             else
@@ -803,9 +819,8 @@ static void print_eval_result(const eval_result_t *res, print_format_t fmt)
     if (read_typed_value(res->addr, &ti, &val) != 0)
         return;
 
-    if (ti.kind == TYPE_POINTER &&
-        fmt == PRINT_FMT_DEFAULT)
-        fmt = PRINT_FMT_POINTER;
+    if (ti.kind == TYPE_POINTER && fmt == PRINT_FMT_DEFAULT)
+        fmt = PRINT_FMT_HEX;
 
     print_value(res->label, val, fmt, res->type_off);
 }
@@ -1566,13 +1581,12 @@ static void print_c_expr(c_expr_t *node, const char *label, print_format_t fmt)
         return;
     }
 
-    if (node->has_lval && ep_is_aggregate_lval(&node->lval)) {
+    if (node->has_lval) {
         print_eval_result(&node->lval, fmt);
         return;
     }
 
-    print_value(label, (unsigned long)node->value, fmt,
-                node->has_lval ? node->lval.type_off : 0);
+    print_value(label, (unsigned long)node->value, fmt, 0);
 }
 
 static int eval_lvalue(const char *expr,
