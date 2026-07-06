@@ -507,6 +507,8 @@ typedef struct {
     char label[256];
 } eval_result_t;
 
+static int apply_deref(eval_result_t *res, int update_label);
+
 static int resolve_member(eval_result_t *res, const char *member)
 {
     type_info_t ti;
@@ -535,6 +537,15 @@ static int resolve_member(eval_result_t *res, const char *member)
 
 static int apply_member(eval_result_t *res, const char *member)
 {
+    type_info_t ti;
+
+    if (get_cached_type(res->type_off, &ti) == 0) {
+        resolve_type_alias(&ti, &res->type_off);
+
+        if (ti.kind == TYPE_POINTER && apply_deref(res, 0) != 0)
+            return -1;
+    }
+
     if (resolve_member(res, member) != 0)
         return -1;
 
@@ -890,8 +901,45 @@ typedef struct {
 typedef struct {
     long value;
     int has_lval;
+    uint32_t rvalue_type_off;
     eval_result_t lval;
 } c_expr_t;
+
+static int apply_addr_of(c_expr_t *out)
+{
+    if (!out->has_lval) {
+        printf("invalid address-of operand\n");
+        return -1;
+    }
+
+    unsigned long addr = out->lval.addr;
+    uint32_t obj_type = out->lval.type_off;
+
+    out->has_lval = 0;
+    out->value = (long)addr;
+    out->rvalue_type_off = lookup_pointer_type(obj_type);
+    return 0;
+}
+
+static int expr_to_ulong(const c_expr_t *node, unsigned long *out)
+{
+    if (node->has_lval) {
+        type_info_t ti = {
+            .kind = TYPE_BASE,
+            .size = 4,
+            .encoding = DW_ATE_signed,
+        };
+
+        if (node->lval.type_off &&
+            get_cached_type(node->lval.type_off, &ti) != 0)
+            return -1;
+
+        return read_typed_value(node->lval.addr, &ti, out);
+    }
+
+    *out = (unsigned long)node->value;
+    return 0;
+}
 
 static int ep_parse_register(ep_t *ep, c_expr_t *out)
 {
@@ -1107,6 +1155,7 @@ static int ep_parse_primary(ep_t *ep, c_expr_t *out)
 
     if (*ep->cur == '(') {
         ep->cur++;
+
         if (ep_parse_or(ep, out) != 0)
             return -1;
 
@@ -1118,6 +1167,17 @@ static int ep_parse_primary(ep_t *ep, c_expr_t *out)
         }
 
         ep->cur++;
+
+        if (out->has_lval) {
+            if (ep_parse_postfix(ep, &out->lval, 0) != 0)
+                return -1;
+
+            if (ep_is_aggregate_lval(&out->lval))
+                return 0;
+
+            return ep_load_scalar(out);
+        }
+
         return 0;
     }
 
@@ -1168,6 +1228,10 @@ static int ep_parse_primary(ep_t *ep, c_expr_t *out)
 
     out->has_lval = 1;
     out->lval = res;
+
+    if (ep_is_aggregate_lval(&res))
+        return 0;
+
     return ep_load_scalar(out);
 }
 
@@ -1212,8 +1276,18 @@ static int ep_parse_unary(ep_t *ep, c_expr_t *out)
         return 0;
     }
 
+    if (*ep->cur == '&' && ep->cur[1] != '&') {
+        ep->cur++;
+
+        if (ep_parse_unary(ep, out) != 0)
+            return -1;
+
+        return apply_addr_of(out);
+    }
+
     if (*ep->cur == '*') {
         ep->cur++;
+
         if (ep_parse_unary(ep, out) != 0)
             return -1;
 
@@ -1224,6 +1298,9 @@ static int ep_parse_unary(ep_t *ep, c_expr_t *out)
 
         if (apply_deref(&out->lval, 1) != 0)
             return -1;
+
+        if (ep_is_aggregate_lval(&out->lval))
+            return 0;
 
         return ep_load_scalar(out);
     }
@@ -1582,56 +1659,39 @@ static void print_c_expr(c_expr_t *node, const char *label, print_format_t fmt)
     }
 
     if (node->has_lval) {
-        print_eval_result(&node->lval, fmt);
+        eval_result_t res = node->lval;
+
+        if (label && label[0]) {
+            strncpy(res.label, label, sizeof(res.label) - 1);
+            res.label[sizeof(res.label) - 1] = '\0';
+        }
+
+        print_eval_result(&res, fmt);
         return;
     }
 
-    print_value(label, (unsigned long)node->value, fmt, 0);
+    print_value(label, (unsigned long)node->value, fmt, node->rvalue_type_off);
 }
+
+static int eval_expression(const char *expr,
+                           unsigned long rip,
+                           c_expr_t *out);
 
 static int eval_lvalue(const char *expr,
                        unsigned long rip,
                        eval_result_t *res)
 {
-    ep_t ep = { .cur = expr, .rip = rip };
-    const char *p = skip_spaces(ep.cur);
-    int deref = 0;
+    c_expr_t node;
 
-    while (*p == '*') {
-        deref = 1;
-        p = skip_spaces(p + 1);
-    }
-
-    char name[64];
-
-    p = parse_c_ident(p, name, sizeof(name));
-
-    if (!p || !name[0])
+    if (eval_expression(expr, rip, &node) != 0)
         return -1;
 
-    if (read_var_addr(name, rip, &res->addr, &res->type_off) != 0) {
-        printf("unknown variable: %s\n", name);
-        return -1;
-    }
-
-    strncpy(res->label, name, sizeof(res->label) - 1);
-    res->label[sizeof(res->label) - 1] = '\0';
-
-    ep.cur = p;
-
-    if (deref && apply_deref(res, 1) != 0)
-        return -1;
-
-    if (ep_parse_postfix(&ep, res, 1) != 0)
-        return -1;
-
-    ep.cur = skip_spaces(ep.cur);
-
-    if (*ep.cur != '\0') {
+    if (!node.has_lval) {
         printf("not an lvalue: %s\n", expr);
         return -1;
     }
 
+    *res = node.lval;
     return 0;
 }
 
@@ -1701,7 +1761,12 @@ static int set_variable_value(const char *args, unsigned long rip)
         return 1;
     }
 
-    if (write_typed_value(res.addr, &ti, (unsigned long)val.value) != 0)
+    unsigned long write_val;
+
+    if (expr_to_ulong(&val, &write_val) != 0)
+        return 1;
+
+    if (write_typed_value(res.addr, &ti, write_val) != 0)
         return 1;
 
     print_eval_result(&res, PRINT_FMT_DEFAULT);

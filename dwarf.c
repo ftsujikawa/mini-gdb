@@ -484,6 +484,32 @@ void resolve_type_alias(type_info_t *ti, uint32_t *orig_off)
     }
 }
 
+uint32_t lookup_pointer_type(uint32_t ref_off)
+{
+    for (int i = 0; i < type_cache_count; i++) {
+        type_info_t ti = type_cache[i].info;
+        uint32_t orig = 0;
+
+        resolve_type_alias(&ti, &orig);
+
+        if (ti.kind == TYPE_POINTER && ti.ref_off == ref_off)
+            return type_cache[i].off;
+    }
+
+    if (ref_off == 0 || type_cache_count >= MAX_TYPE_CACHE)
+        return 0;
+
+    type_info_t pt = {
+        .kind = TYPE_POINTER,
+        .size = (size_t)dwarf_addr_size,
+        .ref_off = ref_off,
+    };
+    uint32_t syn_off = 0xf0000000u ^ ref_off;
+
+    cache_type(syn_off, &pt);
+    return syn_off;
+}
+
 static void preload_types(void)
 {
     for (int i = 0; i < var_count; i++) {
