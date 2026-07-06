@@ -266,6 +266,49 @@ void set_breakpoint(unsigned long addr)
            addr);
 }
 
+void show_breakpoints(void)
+{
+    if (bp_count == 0) {
+        printf("no breakpoints\n");
+        return;
+    }
+
+    printf("Num  Enb  Address            What\n");
+
+    for (int i = 0; i < bp_count; i++) {
+        breakpoint_t *bp = &breakpoints[i];
+        const char *file;
+        int line;
+
+        printf("%-4d %-4s 0x%-16lx",
+               i + 1,
+               bp->enabled ? "y" : "n",
+               bp->addr);
+
+        const symbol_t *sym = lookup_function_symbol(bp->addr);
+
+        if (sym) {
+            unsigned long debug_addr = to_debug_addr(bp->addr);
+
+            printf(" %s", sym->name);
+
+            if (debug_addr > sym->addr)
+                printf("+0x%lx", debug_addr - sym->addr);
+        }
+
+        if (lookup_line(bp->addr, &file, &line) == 0) {
+            if (sym)
+                printf(" at ");
+            else
+                printf(" ");
+
+            printf("%s:%d", file, line);
+        }
+
+        putchar('\n');
+    }
+}
+
 breakpoint_t* find_breakpoint_by_rip(unsigned long rip)
 {
     /*

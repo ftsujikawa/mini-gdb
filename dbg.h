@@ -83,11 +83,18 @@ typedef enum {
     VAR_ADDR
 } var_loc_t;
 
+typedef enum {
+    VAR_KIND_LOCAL,
+    VAR_KIND_ARG,
+    VAR_KIND_GLOBAL
+} var_kind_t;
+
 typedef struct {
     char name[64];
     unsigned long scope_low;
     unsigned long scope_high;
     var_loc_t loc;
+    var_kind_t kind;
     long fbreg;
     unsigned long addr;
     uint32_t type_off;
@@ -211,6 +218,10 @@ void resolve_type_alias(type_info_t *ti, uint32_t *orig_off);
 
 void set_command(const char *args);
 void show_command(const char *args);
+void show_locals(void);
+void show_args(void);
+void show_globals(void);
+void dbg_command(const char *args);
 void print_expression(const char *expr);
 
 void load_symbols(char *path);
@@ -227,6 +238,7 @@ void show_backtrace(void);
 void single_step(void);
 void source_step(void);
 void set_breakpoint(unsigned long addr);
+void show_breakpoints(void);
 breakpoint_t *find_breakpoint(unsigned long addr);
 breakpoint_t *find_breakpoint_by_rip(unsigned long rip);
 int restore_breakpoint(breakpoint_t *bp);
@@ -248,5 +260,6 @@ void disassemble_command(const char *arg);
 
 void handle(char *line);
 void repl(void);
+void show_help(void);
 
 #endif

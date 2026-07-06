@@ -155,15 +155,27 @@ void show_symbols(void)
         return;
     }
 
+    printf("Num  Address            Size   Type  Name\n");
+
     for (int i = 0; i < sym_count; i++) {
         const char *kind =
             symbols[i].type == STT_FUNC ? "func" : "obj";
+        unsigned long addr = symbols[i].addr;
 
-        printf("0x%lx %-4s %s\n",
-               symbols[i].addr,
-               kind,
-               symbols[i].name);
+        if (dbg.running)
+            addr = to_runtime_addr(addr);
+
+        printf("%-4d 0x%-16lx ", i + 1, addr);
+
+        if (symbols[i].size)
+            printf("%-6lu ", symbols[i].size);
+        else
+            printf("%-6s ", "-");
+
+        printf("%-5s %s\n", kind, symbols[i].name);
     }
+
+    printf("%d symbol(s)\n", sym_count);
 }
 
 const symbol_t *lookup_symbol_entry(const char *name)

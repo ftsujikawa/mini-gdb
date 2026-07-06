@@ -113,7 +113,10 @@ static void show_print_settings(void)
 
 static void print_string_value(const char *label, unsigned long addr)
 {
-    printf("%s = \"", label);
+    if (label && label[0])
+        printf("%s = \"", label);
+    else
+        printf("\"");
 
     for (int i = 0; i < MAX_PRINT_STRING; i++) {
         unsigned char c;
@@ -173,22 +176,123 @@ static unsigned long resolve_string_addr(unsigned long addr, uint32_t type_off)
     return addr;
 }
 
+static int format_base_type(const type_info_t *ti, char *buf, size_t buflen)
+{
+    if (ti->encoding == DW_ATE_signed) {
+        switch (ti->size) {
+        case 1:  snprintf(buf, buflen, "char"); break;
+        case 2:  snprintf(buf, buflen, "short"); break;
+        case 4:  snprintf(buf, buflen, "int"); break;
+        case 8:  snprintf(buf, buflen, "long long"); break;
+        default: snprintf(buf, buflen, "<signed%zu>", ti->size); break;
+        }
+    } else if (ti->encoding == DW_ATE_unsigned) {
+        switch (ti->size) {
+        case 1:  snprintf(buf, buflen, "unsigned char"); break;
+        case 2:  snprintf(buf, buflen, "unsigned short"); break;
+        case 4:  snprintf(buf, buflen, "unsigned int"); break;
+        case 8:  snprintf(buf, buflen, "unsigned long long"); break;
+        default: snprintf(buf, buflen, "<unsigned%zu>", ti->size); break;
+        }
+    } else {
+        snprintf(buf, buflen, "<type%zu>", ti->size);
+    }
+
+    return 0;
+}
+
+static int format_type_info(const type_info_t *ti, char *buf, size_t buflen);
+
+static int format_type_string(uint32_t type_off, char *buf, size_t buflen)
+{
+    type_info_t ti;
+
+    if (type_off == 0 || get_cached_type(type_off, &ti) != 0)
+        return -1;
+
+    resolve_type_alias(&ti, NULL);
+    return format_type_info(&ti, buf, buflen);
+}
+
+static int format_type_info(const type_info_t *ti, char *buf, size_t buflen)
+{
+    char inner[96];
+    size_t len;
+
+    switch (ti->kind) {
+    case TYPE_BASE:
+        return format_base_type(ti, buf, buflen);
+
+    case TYPE_POINTER:
+        if (format_type_string(ti->ref_off, inner, sizeof(inner)) != 0)
+            snprintf(inner, sizeof(inner), "void");
+
+        len = strlen(inner);
+
+        if (len > 0 && inner[len - 1] == '*')
+            snprintf(buf, buflen, "%s*", inner);
+        else
+            snprintf(buf, buflen, "%s *", inner);
+
+        return 0;
+
+    case TYPE_STRUCT:
+        if (ti->struct_name[0])
+            snprintf(buf, buflen, "struct %s", ti->struct_name);
+        else
+            snprintf(buf, buflen, "struct");
+
+        return 0;
+
+    case TYPE_ARRAY:
+        if (format_type_string(ti->elem_type_off, inner, sizeof(inner)) != 0)
+            return -1;
+
+        if (ti->array_count > 0)
+            snprintf(buf, buflen, "%s[%d]", inner, ti->array_count);
+        else
+            snprintf(buf, buflen, "%s[]", inner);
+
+        return 0;
+
+    default:
+        return -1;
+    }
+}
+
+static void print_type_annotation(uint32_t type_off)
+{
+    char buf[128];
+
+    if (!print_settings.print_pretty || type_off == 0)
+        return;
+
+    if (format_type_string(type_off, buf, sizeof(buf)) == 0)
+        printf("(%s) ", buf);
+}
+
 static void print_value(const char *label,
                         unsigned long value,
-                        print_format_t fmt)
+                        print_format_t fmt,
+                        uint32_t type_off)
 {
+    if (label && label[0])
+        printf("%s = ", label);
+
+    print_type_annotation(type_off);
+
     if (fmt == PRINT_FMT_DEFAULT)
         fmt = print_settings.format;
 
     switch (fmt) {
     case PRINT_FMT_HEX:
-        printf("%s = 0x%lx\n", label, value);
+        printf("0x%lx\n", value);
         break;
     case PRINT_FMT_OCTAL:
-        printf("%s = %#lo\n", label, value);
+        printf("%#lo\n", value);
         break;
     case PRINT_FMT_BINARY: {
-        printf("%s = 0b", label);
+        printf("0b");
         int started = 0;
 
         for (int i = 63; i >= 0; i--) {
@@ -205,26 +309,26 @@ static void print_value(const char *label,
         break;
     }
     case PRINT_FMT_UNSIGNED:
-        printf("%s = %lu\n", label, value);
+        printf("%lu\n", value);
         break;
     case PRINT_FMT_CHAR: {
         unsigned char c = (unsigned char)value;
 
         if (c >= 32 && c <= 126)
-            printf("%s = '%c'\n", label, (char)c);
+            printf("'%c'\n", (char)c);
         else
-            printf("%s = '\\x%02x'\n", label, c);
+            printf("'\\x%02x'\n", c);
         break;
     }
     case PRINT_FMT_STRING:
-        print_string_value(label, value);
+        print_string_value("", value);
         break;
     case PRINT_FMT_POINTER:
-        printf("%s = %p\n", label, (void *)value);
+        printf("%p\n", (void *)value);
         break;
     case PRINT_FMT_DECIMAL:
     default:
-        printf("%s = %ld\n", label, (long)value);
+        printf("%ld\n", (long)value);
         break;
     }
 }
@@ -513,7 +617,12 @@ static void print_struct_members_inline(unsigned long addr,
                                  &mt, &mval) != 0)
                 continue;
 
-            printf("  %s = ", ti->members[i].name);
+            printf("  ");
+
+            if (print_settings.print_pretty)
+                print_type_annotation(ti->members[i].type_off);
+
+            printf("%s = ", ti->members[i].name);
 
             if (mt.kind == TYPE_POINTER)
                 printf("%p", (void *)mval);
@@ -567,10 +676,13 @@ static void print_struct_members_inline(unsigned long addr,
 static void print_struct_value(const char *label,
                                unsigned long addr,
                                const type_info_t *ti,
-                               print_format_t fmt)
+                               print_format_t fmt,
+                               uint32_t type_off)
 {
     if (label[0])
         printf("%s = ", label);
+
+    print_type_annotation(type_off);
 
     print_struct_members_inline(addr, ti);
     putchar('\n');
@@ -580,10 +692,11 @@ static void print_struct_value(const char *label,
 static void print_array_value(const char *label,
                               unsigned long addr,
                               const type_info_t *ti,
-                              print_format_t fmt)
+                              print_format_t fmt,
+                              uint32_t type_off)
 {
     if (!print_settings.print_array) {
-        print_value(label, addr, PRINT_FMT_POINTER);
+        print_value(label, addr, PRINT_FMT_POINTER, type_off);
         return;
     }
 
@@ -602,7 +715,12 @@ static void print_array_value(const char *label,
         count > print_settings.print_elements)
         count = print_settings.print_elements;
 
-    printf("%s = {", label);
+    if (label[0])
+        printf("%s = ", label);
+
+    print_type_annotation(type_off);
+
+    printf("{");
 
     for (int i = 0; i < count; i++) {
         unsigned long elem_addr =
@@ -620,6 +738,9 @@ static void print_array_value(const char *label,
 
             if (i > 0)
                 printf(", ");
+
+            if (print_settings.print_pretty)
+                print_type_annotation(ti->elem_type_off);
 
             if (elem.kind == TYPE_POINTER)
                 printf("%p", (void *)val);
@@ -646,7 +767,11 @@ static void print_eval_result(const eval_result_t *res, print_format_t fmt)
         unsigned long str_addr =
             resolve_string_addr(res->addr, res->type_off);
 
-        print_string_value(res->label, str_addr);
+        if (res->label[0])
+            printf("%s = ", res->label);
+
+        print_type_annotation(res->type_off);
+        print_string_value("", str_addr);
         return;
     }
 
@@ -657,19 +782,19 @@ static void print_eval_result(const eval_result_t *res, print_format_t fmt)
         if (peek_word(res->addr, &val) != 0)
             return;
 
-        print_value(res->label, val, fmt);
+        print_value(res->label, val, fmt, 0);
         return;
     }
 
     resolve_type_alias(&ti, NULL);
 
     if (ti.kind == TYPE_STRUCT) {
-        print_struct_value(res->label, res->addr, &ti, fmt);
+        print_struct_value(res->label, res->addr, &ti, fmt, res->type_off);
         return;
     }
 
     if (ti.kind == TYPE_ARRAY) {
-        print_array_value(res->label, res->addr, &ti, fmt);
+        print_array_value(res->label, res->addr, &ti, fmt, res->type_off);
         return;
     }
 
@@ -682,7 +807,7 @@ static void print_eval_result(const eval_result_t *res, print_format_t fmt)
         fmt == PRINT_FMT_DEFAULT)
         fmt = PRINT_FMT_POINTER;
 
-    print_value(res->label, val, fmt);
+    print_value(res->label, val, fmt, res->type_off);
 }
 
 typedef struct {
@@ -1446,7 +1571,8 @@ static void print_c_expr(c_expr_t *node, const char *label, print_format_t fmt)
         return;
     }
 
-    print_value(label, (unsigned long)node->value, fmt);
+    print_value(label, (unsigned long)node->value, fmt,
+                node->has_lval ? node->lval.type_off : 0);
 }
 
 static int eval_lvalue(const char *expr,
@@ -1884,6 +2010,163 @@ void set_command(const char *args)
     printf("  set print elements {unlimited|<count>}\n");
 }
 
+static int var_in_scope(const var_entry_t *v, unsigned long rip)
+{
+    unsigned long debug_rip = to_debug_addr(rip);
+
+    return debug_rip >= v->scope_low && debug_rip < v->scope_high;
+}
+
+static void var_entry_to_result(const var_entry_t *v, eval_result_t *res)
+{
+    struct user_regs_struct regs;
+
+    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+    if (v->loc == VAR_FBREG)
+        res->addr = regs.rbp + 16 + v->fbreg;
+    else
+        res->addr = to_runtime_addr(v->addr);
+
+    strncpy(res->label, v->name, sizeof(res->label) - 1);
+    res->label[sizeof(res->label) - 1] = '\0';
+    res->type_off = v->type_off;
+}
+
+static void show_scoped_vars(var_kind_t kind, const char *label)
+{
+    if (!dbg.running) {
+        printf("no process\n");
+        return;
+    }
+
+    struct user_regs_struct regs;
+
+    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+        perror("ptrace getregs");
+        return;
+    }
+
+    int selected[MAX_VARS];
+    int sel_count = 0;
+
+    for (int i = 0; i < var_count; i++) {
+        if (vars[i].kind != kind)
+            continue;
+
+        if (!var_in_scope(&vars[i], regs.rip))
+            continue;
+
+        int replace = -1;
+
+        for (int j = 0; j < sel_count; j++) {
+            if (!strcmp(vars[selected[j]].name, vars[i].name)) {
+                unsigned long old_size =
+                    vars[selected[j]].scope_high - vars[selected[j]].scope_low;
+                unsigned long new_size =
+                    vars[i].scope_high - vars[i].scope_low;
+
+                if (new_size < old_size)
+                    replace = j;
+                else
+                    replace = -2;
+
+                break;
+            }
+        }
+
+        if (replace == -2)
+            continue;
+
+        if (replace >= 0)
+            selected[replace] = i;
+        else
+            selected[sel_count++] = i;
+    }
+
+    if (sel_count == 0) {
+        printf("no %s\n", label);
+        return;
+    }
+
+    for (int j = 0; j < sel_count; j++) {
+        eval_result_t res;
+
+        var_entry_to_result(&vars[selected[j]], &res);
+        print_eval_result(&res, PRINT_FMT_DEFAULT);
+    }
+}
+
+void show_locals(void)
+{
+    show_scoped_vars(VAR_KIND_LOCAL, "locals");
+}
+
+void show_args(void)
+{
+    show_scoped_vars(VAR_KIND_ARG, "arguments");
+}
+
+static int global_name_listed(const char *name)
+{
+    for (int i = 0; i < var_count; i++) {
+        if (vars[i].kind == VAR_KIND_GLOBAL &&
+            !strcmp(vars[i].name, name))
+            return 1;
+    }
+
+    return 0;
+}
+
+void show_globals(void)
+{
+    int shown = 0;
+
+    for (int i = 0; i < var_count; i++) {
+        if (vars[i].kind != VAR_KIND_GLOBAL)
+            continue;
+
+        if (dbg.running) {
+            eval_result_t res;
+
+            var_entry_to_result(&vars[i], &res);
+            print_eval_result(&res, PRINT_FMT_DEFAULT);
+        } else {
+            printf("%s = 0x%lx\n", vars[i].name, vars[i].addr);
+        }
+
+        shown++;
+    }
+
+    for (int i = 0; i < sym_count; i++) {
+        if (symbols[i].type != STT_OBJECT)
+            continue;
+
+        if (global_name_listed(symbols[i].name))
+            continue;
+
+        if (dbg.running) {
+            eval_result_t res = {0};
+
+            strncpy(res.label, symbols[i].name, sizeof(res.label) - 1);
+            res.addr = to_runtime_addr(symbols[i].addr);
+            print_eval_result(&res, PRINT_FMT_DEFAULT);
+        } else {
+            unsigned long addr = symbols[i].addr;
+
+            if (dbg.load_base)
+                addr = to_runtime_addr(addr);
+
+            printf("%s = 0x%lx\n", symbols[i].name, addr);
+        }
+
+        shown++;
+    }
+
+    if (shown == 0)
+        printf("no globals\n");
+}
+
 void show_command(const char *args)
 {
     char buf[256];
@@ -1909,9 +2192,33 @@ void show_command(const char *args)
         return;
     }
 
+    if (!strcmp(args, "bp") || !strcmp(args, "breakpoints")) {
+        show_breakpoints();
+        return;
+    }
+
+    if (!strcmp(args, "locals")) {
+        show_locals();
+        return;
+    }
+
+    if (!strcmp(args, "args") || !strcmp(args, "arguments")) {
+        show_args();
+        return;
+    }
+
+    if (!strcmp(args, "globals")) {
+        show_globals();
+        return;
+    }
+
     printf("usage:\n");
     printf("  show language\n");
     printf("  show print\n");
+    printf("  show bp\n");
+    printf("  show locals\n");
+    printf("  show args\n");
+    printf("  show globals\n");
 }
 
 void print_expression(const char *expr)

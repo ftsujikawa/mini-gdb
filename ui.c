@@ -381,18 +381,39 @@ void show_regs()
 
     struct user_regs_struct regs;
 
-    ptrace(PTRACE_GETREGS,
-           dbg.pid,
-           0,
-           &regs);
+    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+        perror("ptrace getregs");
+        return;
+    }
 
-    printf("RIP : 0x%llx\n", regs.rip);
+    printf("rax      0x%016llx\n", regs.rax);
+    printf("rbx      0x%016llx\n", regs.rbx);
+    printf("rcx      0x%016llx\n", regs.rcx);
+    printf("rdx      0x%016llx\n", regs.rdx);
+    printf("rsi      0x%016llx\n", regs.rsi);
+    printf("rdi      0x%016llx\n", regs.rdi);
+    printf("rbp      0x%016llx\n", regs.rbp);
+    printf("rsp      0x%016llx\n", regs.rsp);
+    printf("r8       0x%016llx\n", regs.r8);
+    printf("r9       0x%016llx\n", regs.r9);
+    printf("r10      0x%016llx\n", regs.r10);
+    printf("r11      0x%016llx\n", regs.r11);
+    printf("r12      0x%016llx\n", regs.r12);
+    printf("r13      0x%016llx\n", regs.r13);
+    printf("r14      0x%016llx\n", regs.r14);
+    printf("r15      0x%016llx\n", regs.r15);
+    printf("rip      0x%016llx\n", regs.rip);
     show_pc_location(regs.rip);
-    printf("RSP : 0x%llx\n", regs.rsp);
-    printf("RAX : 0x%llx\n", regs.rax);
-    printf("RBX : 0x%llx\n", regs.rbx);
-    printf("RCX : 0x%llx\n", regs.rcx);
-    printf("RDX : 0x%llx\n", regs.rdx);
+    printf("eflags   0x%016llx\n", regs.eflags);
+    printf("orig_rax 0x%016llx\n", regs.orig_rax);
+    printf("cs       0x%016llx\n", regs.cs);
+    printf("ss       0x%016llx\n", regs.ss);
+    printf("ds       0x%016llx\n", regs.ds);
+    printf("es       0x%016llx\n", regs.es);
+    printf("fs       0x%016llx\n", regs.fs);
+    printf("gs       0x%016llx\n", regs.gs);
+    printf("fs_base  0x%016llx\n", regs.fs_base);
+    printf("gs_base  0x%016llx\n", regs.gs_base);
 }
 static void print_backtrace_frame(int frame, unsigned long addr)
 {
@@ -453,6 +474,33 @@ void show_backtrace(void)
         rbp = next_rbp;
     }
 }
+
+void show_help(void)
+{
+    printf("Commands:\n");
+    printf("  run <program>              start debugging a program\n");
+    printf("  c                          continue execution\n");
+    printf("  s                          step one source line\n");
+    printf("  si                         step one instruction\n");
+    printf("  n                          step to next source line\n");
+    printf("  up                         run until current function returns\n");
+    printf("  b|break <loc>              set breakpoint (addr, symbol, file:line)\n");
+    printf("  show bp                    list breakpoints\n");
+    printf("  p|print [/fmt] <expr>      evaluate and print an expression\n");
+    printf("  set <name> = <value>       assign variable, register, or setting\n");
+    printf("  show [language|print|bp]   show debugger settings\n");
+    printf("  show locals|args|globals   show variables\n");
+    printf("  dbg [vars|var|lines|line]  show DWARF debug info\n");
+    printf("  l|list [loc]               list source code\n");
+    printf("  dis <loc>                  disassemble instructions\n");
+    printf("  tb                         show backtrace\n");
+    printf("  regs                       show registers\n");
+    printf("  syms                       show symbols\n");
+    printf("  x <addr>                   examine memory\n");
+    printf("  help                       show this help\n");
+    printf("  q                          quit\n");
+}
+
 void handle(char *line)
 {
     if (!strncmp(line, "run ", 4)) {
@@ -529,6 +577,11 @@ void handle(char *line)
         show_command(line + 5);
     }
 
+    else if (!strncmp(line, "dbg ", 4) ||
+             !strcmp(line, "dbg\n")) {
+        dbg_command(line + 4);
+    }
+
     else if (!strncmp(line, "x ", 2)) {
 
         unsigned long addr;
@@ -540,6 +593,10 @@ void handle(char *line)
 
     else if (!strcmp(line, "q\n")) {
         exit(0);
+    }
+
+    else if (!strcmp(line, "help\n")) {
+        show_help();
     }
 
     else if (!strncmp(line, "b ", 2) ||

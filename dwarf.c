@@ -142,7 +142,8 @@ static void add_var_entry(const char *name,
                           unsigned long scope_high,
                           const uint8_t *loc,
                           size_t loc_len,
-                          uint32_t type_off)
+                          uint32_t type_off,
+                          uint64_t tag)
 {
     if (!name || !name[0] || var_count >= MAX_VARS)
         return;
@@ -168,6 +169,14 @@ static void add_var_entry(const char *name,
     v->scope_low = scope_low;
     v->scope_high = scope_high;
     v->type_off = type_off;
+
+    if (tag == DW_TAG_formal_parameter)
+        v->kind = VAR_KIND_ARG;
+    else if (v->loc == VAR_ADDR)
+        v->kind = VAR_KIND_GLOBAL;
+    else
+        v->kind = VAR_KIND_LOCAL;
+
     var_count++;
 }
 
@@ -571,7 +580,7 @@ static void parse_dies(size_t *off,
              ab->tag == DW_TAG_formal_parameter) &&
             name[0] && loc && loc_len > 0) {
             add_var_entry(name, scope_low, scope_high, loc, loc_len,
-                          type_off);
+                          type_off, ab->tag);
         }
 
         if (ab->has_children)
@@ -1307,4 +1316,411 @@ int lookup_next_line_scoped(unsigned long rip,
         *next_line = 0;
 
     return 0;
+}
+
+static unsigned long dbg_current_rip(void)
+{
+    if (!dbg.running)
+        return 0;
+
+    struct user_regs_struct regs;
+
+    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1)
+        return 0;
+
+    return regs.rip;
+}
+
+static const char *type_kind_name(type_kind_t kind)
+{
+    switch (kind) {
+    case TYPE_BASE:    return "base";
+    case TYPE_POINTER: return "pointer";
+    case TYPE_STRUCT:  return "struct";
+    case TYPE_ARRAY:   return "array";
+    case TYPE_ALIAS:   return "alias";
+    default:           return "unknown";
+    }
+}
+
+static void print_type_info(uint32_t type_off, int depth)
+{
+    type_info_t ti;
+    uint32_t orig = type_off;
+    char indent[32];
+
+    if (depth >= (int)sizeof(indent))
+        depth = (int)sizeof(indent) - 1;
+
+    memset(indent, ' ', depth * 2);
+    indent[depth * 2] = '\0';
+
+    if (type_off == 0 || get_cached_type(type_off, &ti) != 0) {
+        printf("%stype: (unknown)\n", indent);
+        return;
+    }
+
+    resolve_type_alias(&ti, &orig);
+
+    printf("%stype: %s", indent, type_kind_name(ti.kind));
+
+    if (ti.struct_name[0])
+        printf(" '%s'", ti.struct_name);
+
+    printf(" (size=%zu", ti.size);
+
+    if (ti.kind == TYPE_BASE) {
+        if (ti.encoding == DW_ATE_signed)
+            printf(", signed");
+        else if (ti.encoding == DW_ATE_unsigned)
+            printf(", unsigned");
+    }
+
+    if (ti.kind == TYPE_ARRAY && ti.array_count > 0)
+        printf(", count=%d", ti.array_count);
+
+    printf(", die=0x%x", orig);
+    printf(")\n");
+
+    if (ti.kind == TYPE_POINTER && ti.ref_off)
+        print_type_info(ti.ref_off, depth + 1);
+
+    if (ti.kind == TYPE_ARRAY && ti.elem_type_off)
+        print_type_info(ti.elem_type_off, depth + 1);
+
+    if (ti.kind == TYPE_STRUCT) {
+        for (int i = 0; i < ti.member_count; i++) {
+            printf("%s  %s @+%ld\n",
+                   indent,
+                   ti.members[i].name,
+                   ti.members[i].offset);
+
+            if (ti.members[i].type_off)
+                print_type_info(ti.members[i].type_off, depth + 1);
+        }
+    }
+}
+
+static void show_var_detail(const var_entry_t *v)
+{
+    unsigned long lo = v->scope_low;
+    unsigned long hi = v->scope_high;
+
+    if (dbg.running) {
+        lo = to_runtime_addr(lo);
+        hi = to_runtime_addr(hi);
+    }
+
+    printf("Variable: %s\n", v->name);
+    printf("Scope:    0x%lx - 0x%lx", lo, hi);
+
+    const symbol_t *sym = lookup_function_symbol(lo);
+
+    if (sym)
+        printf(" (%s)", sym->name);
+
+    putchar('\n');
+
+    if (v->loc == VAR_FBREG)
+        printf("Location: fbreg %ld (rbp%+ld)\n", v->fbreg, v->fbreg);
+    else {
+        unsigned long addr = v->addr;
+
+        if (dbg.running)
+            addr = to_runtime_addr(addr);
+
+        printf("Location: addr 0x%lx\n", addr);
+    }
+
+    print_type_info(v->type_off, 1);
+}
+
+static void show_all_vars(void)
+{
+    if (var_count == 0) {
+        printf("no debug variables loaded (use run first)\n");
+        return;
+    }
+
+    printf("Num  Name                 Scope                         Location\n");
+
+    for (int i = 0; i < var_count; i++) {
+        const var_entry_t *v = &vars[i];
+        unsigned long lo = v->scope_low;
+        unsigned long hi = v->scope_high;
+
+        if (dbg.running) {
+            lo = to_runtime_addr(lo);
+            hi = to_runtime_addr(hi);
+        }
+
+        printf("%-4d %-20s 0x%lx-0x%lx ", i + 1, v->name, lo, hi);
+
+        if (v->loc == VAR_FBREG)
+            printf("fbreg %ld", v->fbreg);
+        else {
+            unsigned long addr = v->addr;
+
+            if (dbg.running)
+                addr = to_runtime_addr(addr);
+
+            printf("addr 0x%lx", addr);
+        }
+
+        putchar('\n');
+    }
+
+    printf("%d variable(s)\n", var_count);
+}
+
+static void show_line_table(const char *file_filter)
+{
+    if (line_entry_count == 0) {
+        printf("no line info loaded (use run first)\n");
+        return;
+    }
+
+    int shown = 0;
+
+    printf("Address            Line  File\n");
+
+    for (int i = 0; i < line_entry_count; i++) {
+        if (file_filter && file_filter[0] &&
+            !file_matches(line_entries[i].file, file_filter))
+            continue;
+
+        unsigned long addr = line_entries[i].addr;
+
+        if (dbg.running)
+            addr = to_runtime_addr(addr);
+
+        printf("0x%-16lx %-5d %s\n",
+               addr,
+               line_entries[i].line,
+               line_entries[i].file);
+        shown++;
+    }
+
+    if (shown == 0)
+        printf("no matching line entries\n");
+    else
+        printf("%d line entr%s\n", shown, shown == 1 ? "y" : "ies");
+}
+
+static void show_location_info(unsigned long addr)
+{
+    const char *file;
+    int line;
+    const symbol_t *sym = lookup_function_symbol(addr);
+    unsigned long debug_addr = to_debug_addr(addr);
+
+    printf("Address: 0x%lx\n", addr);
+
+    if (sym) {
+        printf("Symbol:  %s", sym->name);
+
+        if (debug_addr >= sym->addr)
+            printf("+0x%lx", debug_addr - sym->addr);
+
+        putchar('\n');
+    }
+
+    if (lookup_line(addr, &file, &line) == 0)
+        printf("Line:    %s:%d\n", file, line);
+
+    int in_scope = 0;
+
+    for (int i = 0; i < var_count; i++) {
+        if (debug_addr >= vars[i].scope_low &&
+            debug_addr < vars[i].scope_high) {
+            if (!in_scope) {
+                printf("Variables in scope:\n");
+                in_scope = 1;
+            }
+
+            printf("  %s\n", vars[i].name);
+        }
+    }
+
+    if (!in_scope)
+        printf("Variables in scope: (none)\n");
+}
+
+static void dbg_show_var(const char *name)
+{
+    if (var_count == 0) {
+        printf("no debug variables loaded (use run first)\n");
+        return;
+    }
+
+    unsigned long rip = dbg_current_rip();
+    var_entry_t *v = NULL;
+
+    if (rip != 0)
+        v = lookup_var(name, rip);
+
+    if (!v) {
+        for (int i = 0; i < var_count; i++) {
+            if (!strcmp(vars[i].name, name)) {
+                v = &vars[i];
+                break;
+            }
+        }
+    }
+
+    if (!v) {
+        printf("no debug info for variable: %s\n", name);
+        return;
+    }
+
+    if (rip != 0 &&
+        (to_debug_addr(rip) < v->scope_low ||
+         to_debug_addr(rip) >= v->scope_high))
+        printf("note: not in scope at current pc\n");
+
+    show_var_detail(v);
+}
+
+static void dbg_show_line(const char *loc)
+{
+    char item[256];
+    unsigned long addr;
+    char *colon;
+    char *end;
+
+    strncpy(item, loc, sizeof(item) - 1);
+    item[sizeof(item) - 1] = '\0';
+
+    colon = strrchr(item, ':');
+
+    if (colon && colon[1] != '\0') {
+        char file[256];
+        size_t file_len = colon - item;
+        long line_num;
+
+        if (file_len >= sizeof(file)) {
+            printf("invalid location: %s\n", loc);
+            return;
+        }
+
+        memcpy(file, item, file_len);
+        file[file_len] = '\0';
+
+        line_num = strtol(colon + 1, &end, 10);
+
+        if (*end == '\0' && line_num > 0) {
+            if (lookup_line_addr(file, (int)line_num, &addr) != 0) {
+                printf("no line info for %s\n", loc);
+                return;
+            }
+
+            if (dbg.running)
+                addr = to_runtime_addr(addr);
+
+            show_location_info(addr);
+            return;
+        }
+    }
+
+    addr = strtoul(item, &end, 0);
+
+    if (*end == '\0' && end != item) {
+        if (dbg.running)
+            addr = to_runtime_addr(to_debug_addr(addr));
+
+        show_location_info(addr);
+        return;
+    }
+
+    const symbol_t *sym = lookup_symbol_entry(item);
+
+    if (!sym) {
+        printf("no debug info for: %s\n", loc);
+        return;
+    }
+
+    addr = sym->addr;
+
+    if (sym->type == STT_FUNC)
+        lookup_function_body_addr(sym, &addr);
+
+    if (dbg.running)
+        addr = to_runtime_addr(addr);
+
+    show_location_info(addr);
+}
+
+static void dbg_show_usage(void)
+{
+    printf("usage:\n");
+    printf("  dbg vars                 list all debug variables\n");
+    printf("  dbg var <name>           show variable debug info\n");
+    printf("  dbg lines [file]         list line number table\n");
+    printf("  dbg line <loc>           show debug info for location\n");
+    printf("                           (addr, symbol, or file:line)\n");
+}
+
+void dbg_command(const char *args)
+{
+    char buf[256];
+
+    strncpy(buf, args, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    trim_line(buf);
+    args = buf;
+
+    while (*args == ' ' || *args == '\t')
+        args++;
+
+    if (*args == '\0') {
+        dbg_show_usage();
+        return;
+    }
+
+    if (!strcmp(args, "vars")) {
+        show_all_vars();
+        return;
+    }
+
+    if (!strncmp(args, "var ", 4)) {
+        args += 4;
+
+        while (*args == ' ')
+            args++;
+
+        if (*args == '\0') {
+            printf("usage: dbg var <name>\n");
+            return;
+        }
+
+        dbg_show_var(args);
+        return;
+    }
+
+    if (!strcmp(args, "lines")) {
+        show_line_table(NULL);
+        return;
+    }
+
+    if (!strncmp(args, "lines ", 6)) {
+        show_line_table(args + 6);
+        return;
+    }
+
+    if (!strncmp(args, "line ", 5)) {
+        args += 5;
+
+        while (*args == ' ')
+            args++;
+
+        if (*args == '\0') {
+            printf("usage: dbg line <addr|symbol|file:line>\n");
+            return;
+        }
+
+        dbg_show_line(args);
+        return;
+    }
+
+    dbg_show_usage();
 }
