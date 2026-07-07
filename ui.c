@@ -1,4 +1,5 @@
 #include "dbg.h"
+#include "cmd.h"
 
 #define SOURCE_CONTEXT 5
 
@@ -504,150 +505,80 @@ void show_help(void)
 
 void handle(char *line)
 {
-    if (!strncmp(line, "run ", 4)) {
+    cmd_t cmd = {0};
+    char err[256];
 
-        char program[256];
-
-        sscanf(line, "run %255s", program);
-
-        run_target(program);
+    if (cmd_parse_line(line, &cmd, err, sizeof(err)) != 0) {
+        printf("%s\n", err[0] ? err : "unknown command");
+        cmd_free(&cmd);
+        return;
     }
 
-    else if (!strcmp(line, "c\n")) {
+    switch (cmd.kind) {
+    case CMD_INVALID:
+        break;
+    case CMD_RUN:
+        if (!cmd.arg || !cmd.arg[0]) {
+            printf("usage: run <program>\n");
+            break;
+        }
+        run_target(cmd.arg);
+        break;
+    case CMD_C:
         continue_execution();
-    }
-
-    else if (!strcmp(line, "s\n")) {
+        break;
+    case CMD_S:
         source_step();
-    }
-
-    else if (!strcmp(line, "si\n")) {
+        break;
+    case CMD_SI:
         single_step();
-    }
-
-    else if (!strcmp(line, "n\n")) {
+        break;
+    case CMD_N:
         next_line();
-    }
-
-    else if (!strcmp(line, "up\n")) {
+        break;
+    case CMD_UP:
         finish_function();
-    }
-
-    else if (!strcmp(line, "regs\n")) {
+        break;
+    case CMD_REGS:
         show_regs();
-    }
-
-    else if (!strcmp(line, "syms\n")) {
+        break;
+    case CMD_SYMS:
         show_symbols();
-    }
-
-    else if (!strcmp(line, "tb\n")) {
+        break;
+    case CMD_TB:
         show_backtrace();
-    }
+        break;
+    case CMD_LIST:
+        list_source(cmd.arg ? cmd.arg : "");
+        break;
+    case CMD_DIS:
+        disassemble_command(cmd.arg ? cmd.arg : "");
+        break;
+    case CMD_BREAK: {
+        /* Keep original behavior/errors by reusing old parsing code paths. */
+        char buf[256];
+        strncpy(buf, cmd.arg ? cmd.arg : "", sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        trim_line(buf);
 
-    else if (!strncmp(line, "l ", 2) ||
-             !strcmp(line, "l\n") ||
-             !strncmp(line, "list ", 5) ||
-             !strcmp(line, "list\n")) {
-        char *arg_start =
-            !strncmp(line, "list", 4) ? line + 4 : line + 1;
-
-        list_source(arg_start);
-    }
-
-    else if (!strncmp(line, "dis ", 4)) {
-        disassemble_command(line + 4);
-    }
-
-    else if (!strncmp(line, "p ", 2) ||
-             !strcmp(line, "p\n")) {
-        print_expression(line + 2);
-    }
-
-    else if (!strncmp(line, "print ", 6) ||
-             !strcmp(line, "print\n")) {
-        print_expression(line + 6);
-    }
-
-    else if (!strncmp(line, "set ", 4)) {
-        set_command(line + 4);
-    }
-
-    else if (!strncmp(line, "show ", 5) ||
-             !strcmp(line, "show\n")) {
-        show_command(line + 5);
-    }
-
-    else if (!strncmp(line, "dbg ", 4) ||
-             !strcmp(line, "dbg\n")) {
-        dbg_command(line + 4);
-    }
-
-    else if (!strncmp(line, "lines", 5) &&
-             (line[5] == '\n' || line[5] == '\0' || line[5] == ' ')) {
-        const char *arg = line + 5;
-
-        while (*arg == ' ')
-            arg++;
-
-        if (*arg == '\n' || *arg == '\0') {
-            show_line_table(NULL);
-        } else {
-            char buf[256];
-
-            strncpy(buf, arg, sizeof(buf) - 1);
-            buf[sizeof(buf) - 1] = '\0';
-            trim_line(buf);
-
-            if (buf[0] == '\0')
-                show_line_table(NULL);
-            else
-                show_line_table(buf);
-        }
-    }
-
-    else if (!strncmp(line, "x ", 2)) {
-
-        unsigned long addr;
-
-        sscanf(line, "x %lx", &addr);
-
-        examine_memory(addr);
-    }
-
-    else if (!strcmp(line, "q\n")) {
-        exit(0);
-    }
-
-    else if (!strcmp(line, "help\n")) {
-        show_help();
-    }
-
-    else if (!strncmp(line, "b ", 2) ||
-             !strncmp(line, "break ", 6)) {
-
-        char arg[256];
-        char *arg_start =
-            !strncmp(line, "b ", 2) ? line + 2 : line + 6;
-
-        if (sscanf(arg_start, "%255s", arg) != 1) {
+        if (buf[0] == '\0') {
             printf("usage: b|break <addr|symbol|file:line>\n");
-            return;
+            break;
         }
 
         unsigned long addr;
-        char *colon = strrchr(arg, ':');
+        char *colon = strrchr(buf, ':');
 
         if (colon && colon[1] != '\0') {
             char file[256];
-            size_t file_len = colon - arg;
+            size_t file_len = (size_t)(colon - buf);
 
             if (file_len >= sizeof(file)) {
-                printf("invalid location: %s\n", arg);
-                return;
+                printf("invalid location: %s\n", buf);
+                break;
             }
 
-            memcpy(file, arg, file_len);
+            memcpy(file, buf, file_len);
             file[file_len] = '\0';
 
             char *line_end;
@@ -657,25 +588,23 @@ void handle(char *line)
                 if (lookup_line_addr(file, (int)line_num, &addr) == 0) {
                     set_breakpoint(addr);
                 } else {
-                    printf("no line info for %s:%ld\n",
-                           file, line_num);
+                    printf("no line info for %s:%ld\n", file, line_num);
                 }
-                return;
+                break;
             }
         }
 
         char *end;
+        addr = strtoul(buf, &end, 0);
 
-        addr = strtoul(arg, &end, 0);
-
-        if (*end == '\0' && end != arg) {
+        if (*end == '\0' && end != buf) {
             set_breakpoint(addr);
         } else {
-            const symbol_t *sym = lookup_symbol_entry(arg);
+            const symbol_t *sym = lookup_symbol_entry(buf);
 
             if (!sym) {
-                printf("unknown symbol: %s\n", arg);
-                return;
+                printf("unknown symbol: %s\n", buf);
+                break;
             }
 
             addr = sym->addr;
@@ -685,11 +614,65 @@ void handle(char *line)
 
             set_breakpoint(addr);
         }
+        break;
+    }
+    case CMD_SHOW:
+        show_command(cmd.arg ? cmd.arg : "");
+        break;
+    case CMD_DBG:
+        dbg_command(cmd.arg ? cmd.arg : "");
+        break;
+    case CMD_LINES: {
+        char buf[256];
+        strncpy(buf, cmd.arg ? cmd.arg : "", sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        trim_line(buf);
+
+        if (buf[0] == '\0')
+            show_line_table(NULL);
+        else
+            show_line_table(buf);
+        break;
+    }
+    case CMD_X: {
+        unsigned long addr;
+        char buf[256];
+
+        strncpy(buf, cmd.arg ? cmd.arg : "", sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        trim_line(buf);
+
+        if (buf[0] == '\0') {
+            printf("usage: x <addr>\n");
+            break;
+        }
+
+        if (sscanf(buf, "%lx", &addr) != 1) {
+            printf("usage: x <addr>\n");
+            break;
+        }
+
+        examine_memory(addr);
+        break;
+    }
+    case CMD_PRINT:
+        print_expression(cmd.arg ? cmd.arg : "");
+        break;
+    case CMD_SET:
+        set_command(cmd.arg ? cmd.arg : "");
+        break;
+    case CMD_HELP:
+        show_help();
+        break;
+    case CMD_QUIT:
+        exit(0);
+        break;
+    default:
+        printf("unknown command\n");
+        break;
     }
 
-    else {
-        printf("unknown command\n");
-    }
+    cmd_free(&cmd);
 }
 void repl()
 {

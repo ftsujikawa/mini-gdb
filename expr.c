@@ -921,6 +921,7 @@ static int apply_addr_of(c_expr_t *out)
     return 0;
 }
 
+#ifndef HAVE_EXPR_BISON
 static int expr_to_ulong(const c_expr_t *node, unsigned long *out)
 {
     if (node->has_lval) {
@@ -940,6 +941,7 @@ static int expr_to_ulong(const c_expr_t *node, unsigned long *out)
     *out = (unsigned long)node->value;
     return 0;
 }
+#endif
 
 static int ep_parse_register(ep_t *ep, c_expr_t *out)
 {
@@ -1630,6 +1632,7 @@ static int ep_parse_or(ep_t *ep, c_expr_t *out)
     return 0;
 }
 
+#ifndef HAVE_EXPR_BISON
 static int ep_parse_expr(ep_t *ep, c_expr_t *out)
 {
     if (ep_parse_or(ep, out) != 0)
@@ -1642,6 +1645,7 @@ static int ep_parse_expr(ep_t *ep, c_expr_t *out)
 
     return 0;
 }
+#endif
 
 static void print_c_expr(c_expr_t *node, const char *label, print_format_t fmt)
 {
@@ -1673,10 +1677,74 @@ static void print_c_expr(c_expr_t *node, const char *label, print_format_t fmt)
     print_value(label, (unsigned long)node->value, fmt, node->rvalue_type_off);
 }
 
+#ifndef HAVE_EXPR_BISON
 static int eval_expression(const char *expr,
                            unsigned long rip,
                            c_expr_t *out);
+static int eval_lvalue(const char *expr,
+                       unsigned long rip,
+                       eval_result_t *res);
+#endif
 
+/* If built with flex/bison support, prefer the generated parser+AST evaluator.
+ * Otherwise keep using the existing hand-written parser. */
+static int eval_expression_any(const char *expr, unsigned long rip, c_expr_t *out)
+{
+#ifdef HAVE_EXPR_BISON
+    expr_bison_c_expr_t n;
+    if (eval_expression_bison(expr, rip, &n) != 0)
+        return -1;
+    out->value = n.value;
+    out->has_lval = n.has_lval;
+    out->rvalue_type_off = n.rvalue_type_off;
+    if (n.has_lval) {
+        out->lval.addr = n.lval.addr;
+        out->lval.type_off = n.lval.type_off;
+        strncpy(out->lval.label, n.lval.label, sizeof(out->lval.label) - 1);
+        out->lval.label[sizeof(out->lval.label) - 1] = '\0';
+    }
+    return 0;
+#else
+    return eval_expression(expr, rip, out);
+#endif
+}
+
+static int eval_lvalue_any(const char *expr, unsigned long rip, eval_result_t *res)
+{
+#ifdef HAVE_EXPR_BISON
+    expr_bison_eval_result_t r;
+    if (eval_lvalue_bison(expr, rip, &r) != 0)
+        return -1;
+    res->addr = r.addr;
+    res->type_off = r.type_off;
+    strncpy(res->label, r.label, sizeof(res->label) - 1);
+    res->label[sizeof(res->label) - 1] = '\0';
+    return 0;
+#else
+    return eval_lvalue(expr, rip, res);
+#endif
+}
+
+static int expr_to_ulong_any(const c_expr_t *node, unsigned long *out)
+{
+#ifdef HAVE_EXPR_BISON
+    expr_bison_c_expr_t n = {0};
+    n.value = node->value;
+    n.has_lval = node->has_lval;
+    n.rvalue_type_off = node->rvalue_type_off;
+    if (node->has_lval) {
+        n.lval.addr = node->lval.addr;
+        n.lval.type_off = node->lval.type_off;
+        strncpy(n.lval.label, node->lval.label, sizeof(n.lval.label) - 1);
+        n.lval.label[sizeof(n.lval.label) - 1] = '\0';
+    }
+    return expr_to_ulong_bison(&n, out);
+#else
+    return expr_to_ulong(node, out);
+#endif
+}
+
+#ifndef HAVE_EXPR_BISON
 static int eval_lvalue(const char *expr,
                        unsigned long rip,
                        eval_result_t *res)
@@ -1703,6 +1771,7 @@ static int eval_expression(const char *expr,
 
     return ep_parse_expr(&ep, out);
 }
+#endif
 
 static int set_variable_value(const char *args, unsigned long rip)
 {
@@ -1740,13 +1809,12 @@ static int set_variable_value(const char *args, unsigned long rip)
 
     eval_result_t res;
 
-    if (eval_lvalue(lhs, rip, &res) != 0)
+    if (eval_lvalue_any(lhs, rip, &res) != 0)
         return 1;
 
-    ep_t ep = { .cur = rhs, .rip = rip };
     c_expr_t val;
 
-    if (ep_parse_expr(&ep, &val) != 0)
+    if (eval_expression_any(rhs, rip, &val) != 0)
         return 1;
 
     type_info_t ti = {
@@ -1763,7 +1831,7 @@ static int set_variable_value(const char *args, unsigned long rip)
 
     unsigned long write_val;
 
-    if (expr_to_ulong(&val, &write_val) != 0)
+    if (expr_to_ulong_any(&val, &write_val) != 0)
         return 1;
 
     if (write_typed_value(res.addr, &ti, write_val) != 0)
@@ -1813,10 +1881,9 @@ static int set_register_value(const char *args, unsigned long rip)
         return 1;
     }
 
-    ep_t ep = { .cur = rhs, .rip = rip };
     c_expr_t val;
 
-    if (ep_parse_expr(&ep, &val) != 0)
+    if (eval_expression_any(rhs, rip, &val) != 0)
         return 1;
 
     struct user_regs_struct regs;
@@ -2339,7 +2406,7 @@ void print_expression(const char *expr)
 
     c_expr_t node;
 
-    if (eval_expression(p, regs.rip, &node) != 0) {
+    if (eval_expression_any(p, regs.rip, &node) != 0) {
         if (!*skip_spaces(p))
             printf("usage: print [/format] expr\n");
         return;

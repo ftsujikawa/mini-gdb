@@ -226,6 +226,24 @@ void show_globals(void);
 void dbg_command(const char *args);
 void print_expression(const char *expr);
 
+/* Optional flex/bison expression evaluator (built only if available). */
+typedef struct expr_bison_eval_result {
+    unsigned long addr;
+    uint32_t type_off;
+    char label[256];
+} expr_bison_eval_result_t;
+
+typedef struct expr_bison_c_expr {
+    long value;
+    int has_lval;
+    uint32_t rvalue_type_off;
+    expr_bison_eval_result_t lval;
+} expr_bison_c_expr_t;
+
+int eval_expression_bison(const char *expr, unsigned long rip, expr_bison_c_expr_t *out);
+int eval_lvalue_bison(const char *expr, unsigned long rip, expr_bison_eval_result_t *res);
+int expr_to_ulong_bison(const expr_bison_c_expr_t *node, unsigned long *out);
+
 void load_symbols(char *path);
 void show_symbols(void);
 int lookup_symbol(const char *name, unsigned long *addr);
