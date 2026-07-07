@@ -489,8 +489,9 @@ void show_help(void)
     printf("  show bp                    list breakpoints\n");
     printf("  p|print [/fmt] <expr>      evaluate and print an expression\n");
     printf("  set <name> = <value>       assign variable, register, or setting\n");
-    printf("  show [language|print|bp]   show debugger settings\n");
+    printf("  show [language|print|bp|heap|leaks]   show debugger settings\n");
     printf("  show locals|args|globals   show variables\n");
+    printf("  set heap-trace on            track malloc/free in debuggee\n");
     printf("  dbg [vars|var|lines|line]  show DWARF debug info\n");
     printf("  lines [file]               show line number table\n");
     printf("  l|list [loc]               list source code\n");

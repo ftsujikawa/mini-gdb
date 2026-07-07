@@ -1,7 +1,7 @@
 CC=gcc
 CFLAGS=-Wall -g
 
-CORE_SRCS=dbg_globals.c util.c memory.c dwarf.c expr.c sym.c exec.c ui.c
+CORE_SRCS=dbg_globals.c util.c memory.c dwarf.c expr.c sym.c exec.c ui.c heap.c
 
 HAVE_BISON:=$(shell command -v bison 2>/dev/null)
 HAVE_FLEX:=$(shell command -v flex 2>/dev/null)
@@ -16,7 +16,7 @@ endif
 
 OBJS=$(SRCS:.c=.o)
 
-all: tdb target
+all: tdb target leak_target
 
 tdb: $(OBJS)
 	$(CC) $(CFLAGS) $(OBJS) -o tdb
@@ -24,8 +24,11 @@ tdb: $(OBJS)
 target: target.c
 	$(CC) -g target.c -o target
 
+leak_target: leak_target.c
+	$(CC) -g leak_target.c -o leak_target
+
 clean:
-	rm -f tdb target *.o \
+	rm -f tdb target leak_target *.o \
 		cmd_parser.c cmd_parser.h cmd_lexer.c \
 		expr_parser.c expr_parser.h expr_lexer.c
 

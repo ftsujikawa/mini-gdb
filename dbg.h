@@ -19,6 +19,8 @@
 #include <signal.h>
 #include <elf.h>
 
+#include "heap.h"
+
 typedef struct {
     pid_t pid;
     int running;
@@ -248,6 +250,7 @@ void load_symbols(char *path);
 void show_symbols(void);
 int lookup_symbol(const char *name, unsigned long *addr);
 const symbol_t *lookup_symbol_entry(const char *name);
+int lookup_plt_symbol(const char *name, unsigned long *addr);
 int lookup_function_body_addr(const symbol_t *sym, unsigned long *addr);
 const symbol_t *lookup_function_symbol(unsigned long addr);
 int update_load_base(void);

@@ -2126,6 +2126,30 @@ void set_command(const char *args)
         return;
     }
 
+    if (!strncmp(args, "heap-trace ", 11)) {
+        args += 11;
+
+        while (*args == ' ')
+            args++;
+
+        char name[32];
+
+        if (sscanf(args, "%31s", name) != 1) {
+            printf("usage: set heap-trace {on|off}\n");
+            return;
+        }
+
+        int value;
+
+        if (parse_on_off(name, &value) != 0) {
+            printf("usage: set heap-trace {on|off}\n");
+            return;
+        }
+
+        heap_set_trace(value);
+        return;
+    }
+
     if (strchr(args, '=')) {
         if (!dbg.running) {
             printf("no process\n");
@@ -2154,6 +2178,7 @@ void set_command(const char *args)
     printf("  set print array {on|off}\n");
     printf("  set print pretty {on|off}\n");
     printf("  set print elements {unlimited|<count>}\n");
+    printf("  set heap-trace {on|off}        track malloc/free in debuggee\n");
 }
 
 static int var_in_scope(const var_entry_t *v, unsigned long rip)
@@ -2358,6 +2383,16 @@ void show_command(const char *args)
         return;
     }
 
+    if (!strcmp(args, "heap")) {
+        show_heap();
+        return;
+    }
+
+    if (!strcmp(args, "leaks")) {
+        show_leaks();
+        return;
+    }
+
     printf("usage:\n");
     printf("  show language\n");
     printf("  show print\n");
@@ -2365,6 +2400,8 @@ void show_command(const char *args)
     printf("  show locals\n");
     printf("  show args\n");
     printf("  show globals\n");
+    printf("  show heap\n");
+    printf("  show leaks\n");
 }
 
 void print_expression(const char *expr)

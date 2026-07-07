@@ -148,6 +148,143 @@ void load_symbols(char *path)
     munmap(map, st.st_size);
 }
 
+static int sym_name_matches(const char *sym_name, const char *query)
+{
+    size_t len = strlen(query);
+
+    if (strncmp(sym_name, query, len) != 0)
+        return 0;
+
+    return sym_name[len] == '\0' || sym_name[len] == '@';
+}
+
+int lookup_plt_symbol(const char *name, unsigned long *addr)
+{
+    const char *path =
+        debuggee_path[0] ? debuggee_path : debuggee_realpath;
+
+    if (!path || !path[0])
+        return -1;
+
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0)
+        return -1;
+
+    struct stat st;
+
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    void *map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+    close(fd);
+
+    if (map == MAP_FAILED)
+        return -1;
+
+    Elf64_Ehdr *ehdr = map;
+
+    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+        ehdr->e_ident[EI_MAG3] != ELFMAG3) {
+        munmap(map, st.st_size);
+        return -1;
+    }
+
+    Elf64_Shdr *shdrs =
+        (Elf64_Shdr *)((char *)map + ehdr->e_shoff);
+
+    Elf64_Shdr *dynsym = NULL;
+    Elf64_Shdr *dynstr = NULL;
+    Elf64_Shdr *rela_plt = NULL;
+    Elf64_Shdr *plt = NULL;
+    Elf64_Shdr *plt_sec = NULL;
+
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        const char *shname = "";
+
+        if (ehdr->e_shstrndx < ehdr->e_shnum)
+            shname = (const char *)map +
+                     shdrs[ehdr->e_shstrndx].sh_offset +
+                     shdrs[i].sh_name;
+
+        if (shdrs[i].sh_type == SHT_DYNSYM) {
+            dynsym = &shdrs[i];
+            dynstr = &shdrs[shdrs[i].sh_link];
+        } else if (shdrs[i].sh_type == SHT_RELA &&
+                   !strcmp(shname, ".rela.plt")) {
+            rela_plt = &shdrs[i];
+        } else if (shdrs[i].sh_type == SHT_PROGBITS &&
+                   !strcmp(shname, ".plt")) {
+            plt = &shdrs[i];
+        } else if (shdrs[i].sh_type == SHT_PROGBITS &&
+                   !strcmp(shname, ".plt.sec")) {
+            plt_sec = &shdrs[i];
+        }
+    }
+
+    if (!dynsym || !dynstr || !rela_plt || (!plt && !plt_sec)) {
+        munmap(map, st.st_size);
+        return -1;
+    }
+
+    Elf64_Sym *syms =
+        (Elf64_Sym *)((char *)map + dynsym->sh_offset);
+    char *strs = (char *)map + dynstr->sh_offset;
+    int sym_count_dyn = dynsym->sh_size / sizeof(Elf64_Sym);
+    int sym_index = -1;
+
+    for (int i = 0; i < sym_count_dyn; i++) {
+        if (ELF64_ST_TYPE(syms[i].st_info) != STT_FUNC)
+            continue;
+
+        if (!sym_name_matches(strs + syms[i].st_name, name)) {
+            continue;
+        }
+
+        sym_index = i;
+        break;
+    }
+
+    if (sym_index < 0) {
+        munmap(map, st.st_size);
+        return -1;
+    }
+
+    Elf64_Rela *relas =
+        (Elf64_Rela *)((char *)map + rela_plt->sh_offset);
+    int rela_count = rela_plt->sh_size / sizeof(Elf64_Rela);
+    int rela_index = -1;
+
+    for (int i = 0; i < rela_count; i++) {
+        if (ELF64_R_SYM(relas[i].r_info) == (unsigned)sym_index) {
+            rela_index = i;
+            break;
+        }
+    }
+
+    if (rela_index < 0) {
+        munmap(map, st.st_size);
+        return -1;
+    }
+
+    unsigned long plt_addr;
+
+    if (plt_sec)
+        plt_addr = plt_sec->sh_addr + (unsigned long)(16 * rela_index);
+    else
+        plt_addr = plt->sh_addr + (unsigned long)(16 * (rela_index + 1));
+
+    munmap(map, st.st_size);
+
+    *addr = plt_addr;
+    return 0;
+}
+
 void show_symbols(void)
 {
     if (sym_count == 0) {

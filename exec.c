@@ -1,4 +1,5 @@
 #include "dbg.h"
+#include "heap.h"
 
 #define PTRACE_EVENT_EXEC 4
 
@@ -84,6 +85,10 @@ void run_target(char *program)
     }
 
     dbg.running = 1;
+
+    heap_reset();
+    if (heap_trace_enabled())
+        heap_arm_hooks();
 
     printf("[+] process started pid=%d\n", pid);
 }
@@ -654,86 +659,103 @@ void continue_execution()
         return;
     }
 
-    ptrace(
-        PTRACE_CONT,
-        dbg.pid,
-        0,
-        0
-    );
+    for (;;) {
+        ptrace(
+            PTRACE_CONT,
+            dbg.pid,
+            0,
+            0
+        );
 
-    int status;
+        int status;
 
-    waitpid(
-        dbg.pid,
-        &status,
-        0
-    );
+        waitpid(
+            dbg.pid,
+            &status,
+            0
+        );
 
-    if (WIFEXITED(status)) {
-        disarm_temp_breakpoint(&next_bp);
-        disarm_temp_breakpoint(&finish_bp);
-        printf("[+] process exited\n");
-        dbg.running = 0;
-        return;
-    }
+        if (WIFEXITED(status)) {
+            disarm_temp_breakpoint(&next_bp);
+            disarm_temp_breakpoint(&finish_bp);
+            heap_on_process_exit();
+            heap_disarm_hooks();
+            printf("[+] process exited\n");
+            dbg.running = 0;
+            return;
+        }
 
-    if (WIFSTOPPED(status)) {
+        if (!WIFSTOPPED(status))
+            return;
 
         int sig = WSTOPSIG(status);
 
-        if (sig == SIGTRAP) {
-
+        if (sig != SIGTRAP) {
             struct user_regs_struct regs;
 
-            ptrace(
-                PTRACE_GETREGS,
-                dbg.pid,
-                0,
-                &regs
+            ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+            printf(
+                "[+] stopped signal=%d\n",
+                sig
             );
-
-            if (next_bp.active &&
-                regs.rip - 1 == next_bp.addr) {
-                handle_next_hit();
-                return;
-            }
-
-            if (finish_bp.active &&
-                regs.rip - 1 == finish_bp.addr) {
-                handle_finish_hit();
-                return;
-            }
-
-            breakpoint_t *bp =
-                find_breakpoint_by_rip(
-                    regs.rip
-                );
-
-            if (bp) {
-                disarm_temp_breakpoint(&next_bp);
-                disarm_temp_breakpoint(&finish_bp);
-
-                printf(
-                    "[+] breakpoint hit 0x%lx\n",
-                    bp->addr
-                );
-                show_stop_location(bp->addr);
-
-                if (step_over_breakpoint(bp) != 0)
-                    printf("[-] failed to re-enable breakpoint\n");
-
-                return;
-            }
+            show_stop_location(regs.rip);
+            return;
         }
 
         struct user_regs_struct regs;
 
-        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+        ptrace(
+            PTRACE_GETREGS,
+            dbg.pid,
+            0,
+            &regs
+        );
+
+        if (heap_handle_finish_trap(&regs))
+            continue;
+
+        if (heap_handle_trap(&regs))
+            continue;
+
+        if (next_bp.active &&
+            regs.rip - 1 == next_bp.addr) {
+            handle_next_hit();
+            return;
+        }
+
+        if (finish_bp.active &&
+            regs.rip - 1 == finish_bp.addr) {
+            handle_finish_hit();
+            return;
+        }
+
+        breakpoint_t *bp =
+            find_breakpoint_by_rip(
+                regs.rip
+            );
+
+        if (bp) {
+            disarm_temp_breakpoint(&next_bp);
+            disarm_temp_breakpoint(&finish_bp);
+
+            printf(
+                "[+] breakpoint hit 0x%lx\n",
+                bp->addr
+            );
+            show_stop_location(bp->addr);
+
+            if (step_over_breakpoint(bp) != 0)
+                printf("[-] failed to re-enable breakpoint\n");
+
+            return;
+        }
 
         printf(
             "[+] stopped signal=%d\n",
             sig
         );
         show_stop_location(regs.rip);
+        return;
     }
 }
