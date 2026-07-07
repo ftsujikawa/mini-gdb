@@ -4,13 +4,13 @@ CFLAGS=-Wall -g
 SRCS=dbg_globals.c util.c memory.c dwarf.c expr.c sym.c exec.c ui.c
 OBJS=$(SRCS:.c=.o)
 
-all: mini-gdb target
+all: tdb target
 
-mini-gdb: $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) -o mini-gdb
+tdb: $(OBJS)
+	$(CC) $(CFLAGS) $(OBJS) -o tdb
 
 target: target.c
 	$(CC) -g target.c -o target
 
 clean:
-	rm -f mini-gdb target $(OBJS)
+	rm -f tdb target $(OBJS)

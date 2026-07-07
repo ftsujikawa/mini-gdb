@@ -1499,7 +1499,7 @@ static void show_all_vars(void)
     printf("%d variable(s)\n", var_count);
 }
 
-static void show_line_table(const char *file_filter)
+void show_line_table(const char *file_filter)
 {
     if (line_entry_count == 0) {
         printf("no line info loaded (use run first)\n");

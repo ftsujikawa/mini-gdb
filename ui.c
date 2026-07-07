@@ -491,6 +491,7 @@ void show_help(void)
     printf("  show [language|print|bp]   show debugger settings\n");
     printf("  show locals|args|globals   show variables\n");
     printf("  dbg [vars|var|lines|line]  show DWARF debug info\n");
+    printf("  lines [file]               show line number table\n");
     printf("  l|list [loc]               list source code\n");
     printf("  dis <loc>                  disassemble instructions\n");
     printf("  tb                         show backtrace\n");
@@ -580,6 +581,29 @@ void handle(char *line)
     else if (!strncmp(line, "dbg ", 4) ||
              !strcmp(line, "dbg\n")) {
         dbg_command(line + 4);
+    }
+
+    else if (!strncmp(line, "lines", 5) &&
+             (line[5] == '\n' || line[5] == '\0' || line[5] == ' ')) {
+        const char *arg = line + 5;
+
+        while (*arg == ' ')
+            arg++;
+
+        if (*arg == '\n' || *arg == '\0') {
+            show_line_table(NULL);
+        } else {
+            char buf[256];
+
+            strncpy(buf, arg, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            trim_line(buf);
+
+            if (buf[0] == '\0')
+                show_line_table(NULL);
+            else
+                show_line_table(buf);
+        }
     }
 
     else if (!strncmp(line, "x ", 2)) {
@@ -673,7 +697,7 @@ void repl()
 
     while (1) {
 
-        printf("(mini-gdb) ");
+        printf("(tdb) ");
 
         if (!fgets(line,
                    sizeof(line),

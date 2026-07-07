@@ -208,6 +208,7 @@ void load_variables(char *path);
 void load_line_table(char *path);
 int lookup_line(unsigned long addr, const char **file, int *line);
 int lookup_line_addr(const char *file, int line, unsigned long *addr);
+void show_line_table(const char *file_filter);
 int lookup_next_line(const char *file, int line, int *next_line,
                      unsigned long *addr);
 int lookup_next_line_scoped(unsigned long rip, const char *file, int line,
