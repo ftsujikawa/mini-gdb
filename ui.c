@@ -486,6 +486,7 @@ void show_help(void)
     printf("  n                          step to next source line\n");
     printf("  up                         run until current function returns\n");
     printf("  b|break <loc>              set breakpoint (addr, symbol, file:line)\n");
+    printf("  del|delete <num>           delete breakpoint by number\n");
     printf("  show bp                    list breakpoints\n");
     printf("  p|print [/fmt] <expr>      evaluate and print an expression\n");
     printf("  set <name> = <value>       assign variable, register, or setting\n");
