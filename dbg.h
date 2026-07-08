@@ -262,6 +262,7 @@ void single_step(void);
 void source_step(void);
 void set_breakpoint(unsigned long addr);
 void show_breakpoints(void);
+int delete_breakpoint(int num);
 breakpoint_t *find_breakpoint(unsigned long addr);
 breakpoint_t *find_breakpoint_by_rip(unsigned long rip);
 int restore_breakpoint(breakpoint_t *bp);

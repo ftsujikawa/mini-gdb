@@ -617,6 +617,20 @@ void handle(char *line)
         }
         break;
     }
+    case CMD_DEL: {
+        char *arg = cmd.arg ? cmd.arg : "";
+        char *end;
+        long num = strtol(arg, &end, 10);
+
+        if (*end != '\0' || end == arg || num <= 0) {
+            printf("usage: del|delete <breakpoint-number>\n");
+            printf("       (use 'show b' to list breakpoints)\n");
+            break;
+        }
+
+        delete_breakpoint((int)num);
+        break;
+    }
     case CMD_SHOW:
         show_command(cmd.arg ? cmd.arg : "");
         break;

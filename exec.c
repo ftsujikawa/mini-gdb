@@ -324,6 +324,29 @@ breakpoint_t* find_breakpoint_by_rip(unsigned long rip)
     return find_breakpoint(rip - 1);
 }
 
+int delete_breakpoint(int num)
+{
+    if (num < 1 || num > bp_count) {
+        printf("invalid breakpoint number: %d\n", num);
+        return -1;
+    }
+
+    breakpoint_t *bp = &breakpoints[num - 1];
+
+    if (bp->enabled) {
+        if (restore_breakpoint(bp) == -1)
+            return -1;
+    }
+
+    /* Shift remaining breakpoints down */
+    for (int i = num - 1; i < bp_count - 1; i++)
+        breakpoints[i] = breakpoints[i + 1];
+
+    bp_count--;
+    printf("Breakpoint %d deleted\n", num);
+    return 0;
+}
+
 int restore_breakpoint(breakpoint_t *bp)
 {
     if (ptrace(

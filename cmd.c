@@ -134,6 +134,9 @@ int cmd_parse_line(const char *line, cmd_t *out,
     } else if (!strcmp(cmd, "b") || !strcmp(cmd, "break")) {
         out->kind = CMD_BREAK;
         out->arg = dup_str(tmp);
+    } else if (!strcmp(cmd, "del") || !strcmp(cmd, "delete")) {
+        out->kind = CMD_DEL;
+        out->arg = dup_str(tmp);
     } else if (!strcmp(cmd, "show")) {
         out->kind = CMD_SHOW;
         out->arg = dup_str(tmp);

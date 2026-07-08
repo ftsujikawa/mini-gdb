@@ -17,6 +17,7 @@ typedef enum {
     CMD_LIST,
     CMD_DIS,
     CMD_BREAK,
+    CMD_DEL,
     CMD_SHOW,
     CMD_DBG,
     CMD_LINES,

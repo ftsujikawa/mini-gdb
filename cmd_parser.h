@@ -79,15 +79,17 @@ extern int cmdyydebug;
     T_DIS = 272,                   /* T_DIS  */
     T_B = 273,                     /* T_B  */
     T_BREAK = 274,                 /* T_BREAK  */
-    T_SHOW = 275,                  /* T_SHOW  */
-    T_DBG = 276,                   /* T_DBG  */
-    T_LINES = 277,                 /* T_LINES  */
-    T_X = 278,                     /* T_X  */
-    T_P = 279,                     /* T_P  */
-    T_PRINT = 280,                 /* T_PRINT  */
-    T_SET = 281,                   /* T_SET  */
-    T_HELP = 282,                  /* T_HELP  */
-    T_Q = 283                      /* T_Q  */
+    T_DEL = 275,                   /* T_DEL  */
+    T_DELETE = 276,                /* T_DELETE  */
+    T_SHOW = 277,                  /* T_SHOW  */
+    T_DBG = 278,                   /* T_DBG  */
+    T_LINES = 279,                 /* T_LINES  */
+    T_X = 280,                     /* T_X  */
+    T_P = 281,                     /* T_P  */
+    T_PRINT = 282,                 /* T_PRINT  */
+    T_SET = 283,                   /* T_SET  */
+    T_HELP = 284,                  /* T_HELP  */
+    T_Q = 285                      /* T_Q  */
   };
   typedef enum cmdyytokentype cmdyytoken_kind_t;
 #endif
@@ -100,7 +102,7 @@ union CMDYYSTYPE
 
     char *str;
 
-#line 104 "cmd_parser.h"
+#line 106 "cmd_parser.h"
 
 };
 typedef union CMDYYSTYPE CMDYYSTYPE;
