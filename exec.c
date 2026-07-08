@@ -691,12 +691,11 @@ void continue_execution()
         );
 
         int status;
+        pid_t ret;
 
-        waitpid(
-            dbg.pid,
-            &status,
-            0
-        );
+        do {
+            ret = waitpid(dbg.pid, &status, 0);
+        } while (ret == -1 && errno == EINTR);
 
         if (WIFEXITED(status)) {
             disarm_temp_breakpoint(&next_bp);

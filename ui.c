@@ -690,6 +690,13 @@ void handle(char *line)
 
     cmd_free(&cmd);
 }
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    if (dbg.running && dbg.pid > 0)
+        kill(dbg.pid, SIGINT);
+}
+
 void repl()
 {
     char line[256];
@@ -709,6 +716,7 @@ void repl()
 
 int main()
 {
+    signal(SIGINT, sigint_handler);
     repl();
     return 0;
 }
