@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 struct test_struct {
     int a;
@@ -21,6 +22,8 @@ int main()
     struct test_struct *ts_ptr = &ts;
     struct test_struct sa[3] = {0};
     struct test_struct *sa_ptr = sa;
+
+    void *pm = malloc(100);
 
     while (1) {
 
