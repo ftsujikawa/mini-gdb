@@ -225,6 +225,10 @@ void show_stop_location(unsigned long pc)
     const char *file;
     int line;
 
+    /* This debugger only ever tracks a single (main) thread, whose tid
+     * equals its pid, so both are reported from dbg.pid. */
+    printf("[+] pid=%d tid=%d\n", dbg.pid, dbg.pid);
+
     if (lookup_line(pc, &file, &line) == 0) {
         printf("=> %s:%d\n", file, line);
 

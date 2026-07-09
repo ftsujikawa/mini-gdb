@@ -213,8 +213,6 @@ int lookup_line_addr(const char *file, int line, unsigned long *addr);
 void show_line_table(const char *file_filter);
 int lookup_next_line(const char *file, int line, int *next_line,
                      unsigned long *addr);
-int lookup_next_line_scoped(unsigned long rip, const char *file, int line,
-                            int *next_line, unsigned long *addr);
 var_entry_t *lookup_var(const char *name, unsigned long rip);
 int get_cached_type(uint32_t off, type_info_t *out);
 void resolve_type_alias(type_info_t *ti, uint32_t *orig_off);

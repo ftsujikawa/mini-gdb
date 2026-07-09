@@ -457,6 +457,12 @@ int step_over_breakpoint(breakpoint_t *bp)
     return 0;
 }
 
+/* Internal temp breakpoint used by next_line() to silently skip over a
+ * `call` instruction (run to its return address) without ending the
+ * enclosing `next` step. Unlike next_bp/finish_bp, reaching it is never
+ * reported to the user. */
+static finish_bp_t step_over_bp = {0};
+
 static int arm_temp_breakpoint(finish_bp_t *tp, unsigned long addr)
 {
     breakpoint_t *existing = find_breakpoint(addr);
@@ -629,6 +635,31 @@ void finish_function(void)
     continue_execution();
 }
 
+/* Detects a `call` opcode at *addr (near-relative 0xE8, or near-indirect
+ * 0xFF /2 or /3). REX-prefixed indirect calls (e.g. through r8-r15) are
+ * not recognized and fall back to plain single-stepping into the callee. */
+static int insn_is_call(unsigned long addr)
+{
+    long insn = read_memory(addr);
+
+    if (insn == -1)
+        return 0;
+
+    unsigned char op = (unsigned char)insn;
+    unsigned char modrm = (unsigned char)(insn >> 8);
+
+    if (op == 0xe8)
+        return 1;
+
+    if (op == 0xff && ((modrm >> 3) & 7) == 2)
+        return 1;
+
+    if (op == 0xff && ((modrm >> 3) & 7) == 3)
+        return 1;
+
+    return 0;
+}
+
 void next_line(void)
 {
     if (!dbg.running) {
@@ -650,29 +681,87 @@ void next_line(void)
 
     ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
 
-    const char *file;
-    int line;
+    const char *start_file;
+    int start_line;
 
-    if (lookup_line(regs.rip, &file, &line) != 0) {
+    if (lookup_line(regs.rip, &start_file, &start_line) != 0) {
         printf("no line info\n");
         return;
     }
 
-    int next_line_num;
-    unsigned long next_addr;
+    unsigned long start_rsp = regs.rsp;
 
-    if (lookup_next_line_scoped(regs.rip, file, line,
-                              &next_line_num, &next_addr) != 0) {
-        printf("no next line\n");
-        return;
+    for (int i = 0; i < 100000; i++) {
+        int is_call = insn_is_call(regs.rip);
+
+        if (ptrace(PTRACE_SINGLESTEP, dbg.pid, 0, 0) == -1) {
+            perror("ptrace singlestep");
+            return;
+        }
+
+        int status;
+
+        if (waitpid(dbg.pid, &status, 0) < 0) {
+            perror("waitpid");
+            return;
+        }
+
+        if (WIFEXITED(status)) {
+            printf("[+] process exited\n");
+            dbg.running = 0;
+            return;
+        }
+
+        if (!WIFSTOPPED(status))
+            continue;
+
+        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+        if (is_call) {
+            /* Just entered a callee: run to its return address instead
+             * of single-stepping through it, so calls (e.g. into libc)
+             * are skipped efficiently while breakpoints/heap hooks
+             * encountered along the way are still honored. */
+            long ret_addr = read_memory(regs.rsp);
+
+            if (ret_addr != -1 &&
+                arm_temp_breakpoint(&step_over_bp,
+                                     (unsigned long)ret_addr) == 0) {
+                continue_execution();
+
+                if (!dbg.running)
+                    return;
+
+                ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+                if (regs.rip != (unsigned long long)ret_addr) {
+                    /* continue_execution stopped at some other event
+                     * (a real breakpoint inside the call, or a signal)
+                     * before reaching the return address, and already
+                     * reported it; end this `next` here too. */
+                    disarm_temp_breakpoint(&step_over_bp);
+                    return;
+                }
+            }
+        }
+
+        const char *file;
+        int line;
+        int changed = lookup_line(regs.rip, &file, &line) != 0 ||
+                      line != start_line || strcmp(file, start_file);
+
+        /* Stop once we reach a different line at the same or a shallower
+         * stack depth than where we started (covers both a straight
+         * line-to-line advance and returning from the function). Ignore
+         * line changes while still deeper in an unrecognized callee. */
+        if (changed && regs.rsp >= start_rsp) {
+            printf("[+] next line at 0x%llx\n", regs.rip);
+            show_pc_location(regs.rip);
+            return;
+        }
     }
 
-    if (arm_temp_breakpoint(&next_bp, next_addr) != 0)
-        return;
-
-    printf("[+] next until %s:%d (0x%lx)\n",
-           file_basename(file), next_line_num, next_addr);
-    continue_execution();
+    printf("next line limit reached\n");
 }
 
 void continue_execution()
@@ -700,6 +789,7 @@ void continue_execution()
         if (WIFEXITED(status)) {
             disarm_temp_breakpoint(&next_bp);
             disarm_temp_breakpoint(&finish_bp);
+            disarm_temp_breakpoint(&step_over_bp);
             heap_on_process_exit();
             heap_disarm_hooks();
             printf("[+] process exited\n");
@@ -716,6 +806,10 @@ void continue_execution()
             struct user_regs_struct regs;
 
             ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+            disarm_temp_breakpoint(&next_bp);
+            disarm_temp_breakpoint(&finish_bp);
+            disarm_temp_breakpoint(&step_over_bp);
 
             printf(
                 "[+] stopped signal=%d\n",
@@ -740,6 +834,12 @@ void continue_execution()
         if (heap_handle_trap(&regs))
             continue;
 
+        if (step_over_bp.active &&
+            regs.rip - 1 == step_over_bp.addr) {
+            handle_temp_stop(&step_over_bp);
+            return;
+        }
+
         if (next_bp.active &&
             regs.rip - 1 == next_bp.addr) {
             handle_next_hit();
@@ -760,6 +860,7 @@ void continue_execution()
         if (bp) {
             disarm_temp_breakpoint(&next_bp);
             disarm_temp_breakpoint(&finish_bp);
+            disarm_temp_breakpoint(&step_over_bp);
 
             printf(
                 "[+] breakpoint hit 0x%lx\n",
