@@ -503,6 +503,7 @@ void show_help(void)
     printf("  x <addr>                   examine memory\n");
     printf("  help                       show this help\n");
     printf("  q                          quit\n");
+    printf("  Ctrl+C                     interrupt running program\n");
 }
 
 void handle(char *line)
