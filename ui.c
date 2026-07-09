@@ -526,7 +526,7 @@ void show_help(void)
     printf("  c                          continue execution\n");
     printf("  s                          step one source line\n");
     printf("  si                         step one instruction\n");
-    printf("  n                          step to next source line\n");
+    printf("  n                          step to next source line (steps over calls)\n");
     printf("  up                         run until current function returns\n");
     printf("  b|break <loc>              set breakpoint (addr, symbol, file:line)\n");
     printf("  del|delete <num>           delete breakpoint by number\n");
