@@ -836,9 +836,19 @@ static void print_eval_result(const eval_result_t *res, print_format_t fmt)
     print_value(res->label, val, fmt, res->type_off);
 }
 
+typedef enum {
+    REG_KIND_GPR,      /* field in struct user_regs_struct, 8 bytes */
+    REG_KIND_FPCTRL16, /* field in struct user_fpregs_struct, 2 bytes */
+    REG_KIND_FPCTRL32, /* field in struct user_fpregs_struct, 4 bytes */
+    REG_KIND_ST,       /* x87 stack register, index into st_space */
+    REG_KIND_XMM,      /* SSE register, index into xmm_space */
+} reg_kind_t;
+
 typedef struct {
     const char *name;
+    reg_kind_t kind;
     size_t offset;
+    int index;
 } reg_info_t;
 
 static int reg_name_equal(const char *a, const char *b)
@@ -856,28 +866,49 @@ static int reg_name_equal(const char *a, const char *b)
 static int lookup_register(const char *name, const reg_info_t **info_out)
 {
     static const reg_info_t regs[] = {
-        { "rip", offsetof(struct user_regs_struct, rip) },
-        { "pc",  offsetof(struct user_regs_struct, rip) },
-        { "eip", offsetof(struct user_regs_struct, rip) },
-        { "rsp", offsetof(struct user_regs_struct, rsp) },
-        { "sp",  offsetof(struct user_regs_struct, rsp) },
-        { "rbp", offsetof(struct user_regs_struct, rbp) },
-        { "bp",  offsetof(struct user_regs_struct, rbp) },
-        { "rax", offsetof(struct user_regs_struct, rax) },
-        { "rbx", offsetof(struct user_regs_struct, rbx) },
-        { "rcx", offsetof(struct user_regs_struct, rcx) },
-        { "rdx", offsetof(struct user_regs_struct, rdx) },
-        { "rsi", offsetof(struct user_regs_struct, rsi) },
-        { "rdi", offsetof(struct user_regs_struct, rdi) },
-        { "r8",  offsetof(struct user_regs_struct, r8) },
-        { "r9",  offsetof(struct user_regs_struct, r9) },
-        { "r10", offsetof(struct user_regs_struct, r10) },
-        { "r11", offsetof(struct user_regs_struct, r11) },
-        { "r12", offsetof(struct user_regs_struct, r12) },
-        { "r13", offsetof(struct user_regs_struct, r13) },
-        { "r14", offsetof(struct user_regs_struct, r14) },
-        { "r15", offsetof(struct user_regs_struct, r15) },
-        { "eflags", offsetof(struct user_regs_struct, eflags) },
+        { "rip", REG_KIND_GPR, offsetof(struct user_regs_struct, rip), 0 },
+        { "pc",  REG_KIND_GPR, offsetof(struct user_regs_struct, rip), 0 },
+        { "eip", REG_KIND_GPR, offsetof(struct user_regs_struct, rip), 0 },
+        { "rsp", REG_KIND_GPR, offsetof(struct user_regs_struct, rsp), 0 },
+        { "sp",  REG_KIND_GPR, offsetof(struct user_regs_struct, rsp), 0 },
+        { "rbp", REG_KIND_GPR, offsetof(struct user_regs_struct, rbp), 0 },
+        { "bp",  REG_KIND_GPR, offsetof(struct user_regs_struct, rbp), 0 },
+        { "rax", REG_KIND_GPR, offsetof(struct user_regs_struct, rax), 0 },
+        { "rbx", REG_KIND_GPR, offsetof(struct user_regs_struct, rbx), 0 },
+        { "rcx", REG_KIND_GPR, offsetof(struct user_regs_struct, rcx), 0 },
+        { "rdx", REG_KIND_GPR, offsetof(struct user_regs_struct, rdx), 0 },
+        { "rsi", REG_KIND_GPR, offsetof(struct user_regs_struct, rsi), 0 },
+        { "rdi", REG_KIND_GPR, offsetof(struct user_regs_struct, rdi), 0 },
+        { "r8",  REG_KIND_GPR, offsetof(struct user_regs_struct, r8), 0 },
+        { "r9",  REG_KIND_GPR, offsetof(struct user_regs_struct, r9), 0 },
+        { "r10", REG_KIND_GPR, offsetof(struct user_regs_struct, r10), 0 },
+        { "r11", REG_KIND_GPR, offsetof(struct user_regs_struct, r11), 0 },
+        { "r12", REG_KIND_GPR, offsetof(struct user_regs_struct, r12), 0 },
+        { "r13", REG_KIND_GPR, offsetof(struct user_regs_struct, r13), 0 },
+        { "r14", REG_KIND_GPR, offsetof(struct user_regs_struct, r14), 0 },
+        { "r15", REG_KIND_GPR, offsetof(struct user_regs_struct, r15), 0 },
+        { "eflags", REG_KIND_GPR, offsetof(struct user_regs_struct, eflags), 0 },
+
+        { "fctrl", REG_KIND_FPCTRL16, offsetof(struct user_fpregs_struct, cwd), 0 },
+        { "fstat", REG_KIND_FPCTRL16, offsetof(struct user_fpregs_struct, swd), 0 },
+        { "ftag",  REG_KIND_FPCTRL16, offsetof(struct user_fpregs_struct, ftw), 0 },
+        { "fop",   REG_KIND_FPCTRL16, offsetof(struct user_fpregs_struct, fop), 0 },
+        { "mxcsr", REG_KIND_FPCTRL32, offsetof(struct user_fpregs_struct, mxcsr), 0 },
+        { "mxcsr_mask", REG_KIND_FPCTRL32, offsetof(struct user_fpregs_struct, mxcr_mask), 0 },
+
+        { "st0", REG_KIND_ST, 0, 0 }, { "st1", REG_KIND_ST, 0, 1 },
+        { "st2", REG_KIND_ST, 0, 2 }, { "st3", REG_KIND_ST, 0, 3 },
+        { "st4", REG_KIND_ST, 0, 4 }, { "st5", REG_KIND_ST, 0, 5 },
+        { "st6", REG_KIND_ST, 0, 6 }, { "st7", REG_KIND_ST, 0, 7 },
+
+        { "xmm0",  REG_KIND_XMM, 0, 0 },  { "xmm1",  REG_KIND_XMM, 0, 1 },
+        { "xmm2",  REG_KIND_XMM, 0, 2 },  { "xmm3",  REG_KIND_XMM, 0, 3 },
+        { "xmm4",  REG_KIND_XMM, 0, 4 },  { "xmm5",  REG_KIND_XMM, 0, 5 },
+        { "xmm6",  REG_KIND_XMM, 0, 6 },  { "xmm7",  REG_KIND_XMM, 0, 7 },
+        { "xmm8",  REG_KIND_XMM, 0, 8 },  { "xmm9",  REG_KIND_XMM, 0, 9 },
+        { "xmm10", REG_KIND_XMM, 0, 10 }, { "xmm11", REG_KIND_XMM, 0, 11 },
+        { "xmm12", REG_KIND_XMM, 0, 12 }, { "xmm13", REG_KIND_XMM, 0, 13 },
+        { "xmm14", REG_KIND_XMM, 0, 14 }, { "xmm15", REG_KIND_XMM, 0, 15 },
     };
 
     if (*name == '$')
@@ -1881,28 +1912,112 @@ static int set_register_value(const char *args, unsigned long rip)
         return 1;
     }
 
+    /* Floating-point literal (e.g. "3.4") assigned to an FP register:
+     * bypass the integer-only expression evaluator and store the real
+     * IEEE-754 bit pattern instead of interpreting it as a raw integer. */
+    if ((reg->kind == REG_KIND_ST || reg->kind == REG_KIND_XMM) &&
+        strncmp(rhs, "0x", 2) && strncmp(rhs, "0X", 2) &&
+        strpbrk(rhs, ".eE")) {
+        char *end;
+        long double fval = strtold(rhs, &end);
+
+        end = (char *)skip_spaces(end);
+
+        if (end != rhs && *end == '\0') {
+            struct user_fpregs_struct fpregs;
+
+            if (ptrace(PTRACE_GETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+                perror("ptrace getfpregs");
+                return 1;
+            }
+
+            if (reg->kind == REG_KIND_ST) {
+                memset(&fpregs.st_space[reg->index * 4], 0,
+                       4 * sizeof(unsigned int));
+                memcpy(&fpregs.st_space[reg->index * 4], &fval,
+                       sizeof(fval));
+            } else {
+                double dval = (double)fval;
+
+                memset(&fpregs.xmm_space[reg->index * 4], 0,
+                       4 * sizeof(unsigned int));
+                memcpy(&fpregs.xmm_space[reg->index * 4], &dval,
+                       sizeof(dval));
+            }
+
+            if (ptrace(PTRACE_SETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+                perror("ptrace setfpregs");
+                return 1;
+            }
+
+            printf("$%s = %Lg\n", reg->name, fval);
+            return 1;
+        }
+    }
+
     c_expr_t val;
 
     if (eval_expression_any(rhs, rip, &val) != 0)
         return 1;
 
-    struct user_regs_struct regs;
+    unsigned long long rawval = (unsigned long long)val.value;
 
-    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
-        perror("ptrace getregs");
+    if (reg->kind == REG_KIND_GPR) {
+        struct user_regs_struct regs;
+
+        if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+            perror("ptrace getregs");
+            return 1;
+        }
+
+        *(unsigned long long *)((char *)&regs + reg->offset) = rawval;
+
+        if (ptrace(PTRACE_SETREGS, dbg.pid, 0, &regs) == -1) {
+            perror("ptrace setregs");
+            return 1;
+        }
+
+        printf("$%s = 0x%llx\n", reg->name, rawval);
         return 1;
     }
 
-    *(unsigned long long *)((char *)&regs + reg->offset) =
-        (unsigned long long)val.value;
+    struct user_fpregs_struct fpregs;
 
-    if (ptrace(PTRACE_SETREGS, dbg.pid, 0, &regs) == -1) {
-        perror("ptrace setregs");
+    if (ptrace(PTRACE_GETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+        perror("ptrace getfpregs");
         return 1;
     }
 
-    printf("$%s = 0x%llx\n", reg->name,
-           (unsigned long long)val.value);
+    switch (reg->kind) {
+    case REG_KIND_FPCTRL16:
+        *(unsigned short *)((char *)&fpregs + reg->offset) =
+            (unsigned short)rawval;
+        break;
+    case REG_KIND_FPCTRL32:
+        *(unsigned int *)((char *)&fpregs + reg->offset) =
+            (unsigned int)rawval;
+        break;
+    case REG_KIND_ST:
+        /* 80-bit x87 register: set the 8-byte mantissa/value bits, clear
+         * the remaining bytes of the 16-byte slot (sign/exponent + pad). */
+        memset(&fpregs.st_space[reg->index * 4], 0, 4 * sizeof(unsigned int));
+        memcpy(&fpregs.st_space[reg->index * 4], &rawval, sizeof(rawval));
+        break;
+    case REG_KIND_XMM:
+        /* 128-bit SSE register: set the low 64 bits, clear the high 64. */
+        memset(&fpregs.xmm_space[reg->index * 4], 0, 4 * sizeof(unsigned int));
+        memcpy(&fpregs.xmm_space[reg->index * 4], &rawval, sizeof(rawval));
+        break;
+    default:
+        break;
+    }
+
+    if (ptrace(PTRACE_SETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+        perror("ptrace setfpregs");
+        return 1;
+    }
+
+    printf("$%s = 0x%llx\n", reg->name, rawval);
     return 1;
 }
 
@@ -2168,7 +2283,10 @@ void set_command(const char *args)
     }
 
     printf("usage:\n");
-    printf("  set $<register> = <expr>\n");
+    printf("  set $<register> = <expr>       "
+           "gpr, fctrl/fstat/ftag/fop/mxcsr, st0-7, xmm0-15\n");
+    printf("  set $<st0-7|xmm0-15> = <float> "
+           "e.g. set $xmm0 = 3.4\n");
     printf("  set variable <expr> = <value>\n");
     printf("  set <expr> = <value>\n");
     printf("  set language c\n");

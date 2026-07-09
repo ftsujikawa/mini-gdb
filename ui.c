@@ -415,6 +415,45 @@ void show_regs()
     printf("gs       0x%016llx\n", regs.gs);
     printf("fs_base  0x%016llx\n", regs.fs_base);
     printf("gs_base  0x%016llx\n", regs.gs_base);
+
+    struct user_fpregs_struct fpregs;
+
+    if (ptrace(PTRACE_GETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+        perror("ptrace getfpregs");
+        return;
+    }
+
+    printf("\n");
+    printf("fctrl      0x%04x\n", fpregs.cwd);
+    printf("fstat      0x%04x\n", fpregs.swd);
+    printf("ftag       0x%04x\n", fpregs.ftw);
+    printf("fop        0x%04x\n", fpregs.fop);
+    printf("fioff      0x%016llx\n", fpregs.rip);
+    printf("fooff      0x%016llx\n", fpregs.rdp);
+    printf("mxcsr      0x%08x\n", fpregs.mxcsr);
+    printf("mxcsr_mask 0x%08x\n", fpregs.mxcr_mask);
+
+    for (int i = 0; i < 8; i++) {
+        unsigned char bytes[10];
+        long double val = 0;
+
+        memcpy(bytes, &fpregs.st_space[i * 4], sizeof(bytes));
+        memcpy(&val, &fpregs.st_space[i * 4], sizeof(val));
+        printf("st%-2d       0x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x  %Lg\n",
+               i,
+               bytes[9], bytes[8], bytes[7], bytes[6], bytes[5],
+               bytes[4], bytes[3], bytes[2], bytes[1], bytes[0], val);
+    }
+
+    for (int i = 0; i < 16; i++) {
+        unsigned int *x = &fpregs.xmm_space[i * 4];
+        double lo, hi;
+
+        memcpy(&lo, &x[0], sizeof(lo));
+        memcpy(&hi, &x[2], sizeof(hi));
+        printf("xmm%-2d      0x%08x%08x%08x%08x  {v2_double = {%g, %g}}\n",
+               i, x[3], x[2], x[1], x[0], lo, hi);
+    }
 }
 static void print_backtrace_frame(int frame, unsigned long addr)
 {
@@ -490,6 +529,8 @@ void show_help(void)
     printf("  show bp                    list breakpoints\n");
     printf("  p|print [/fmt] <expr>      evaluate and print an expression\n");
     printf("  set <name> = <value>       assign variable, register, or setting\n");
+    printf("  set $<reg> = <expr>        gpr/eflags/fctrl/fstat/ftag/fop/mxcsr\n");
+    printf("  set $<st0-7|xmm0-15> = <v> x87/SSE register (float or hex bits)\n");
     printf("  show [language|print|bp|heap|leaks]   show debugger settings\n");
     printf("  show locals|args|globals   show variables\n");
     printf("  set heap-trace on            track malloc/free in debuggee\n");
@@ -498,7 +539,7 @@ void show_help(void)
     printf("  l|list [loc]               list source code\n");
     printf("  dis <loc>                  disassemble instructions\n");
     printf("  tb                         show backtrace\n");
-    printf("  regs                       show registers\n");
+    printf("  regs                       show registers (gpr, x87, SSE/XMM)\n");
     printf("  syms                       show symbols\n");
     printf("  x <addr>                   examine memory\n");
     printf("  help                       show this help\n");
