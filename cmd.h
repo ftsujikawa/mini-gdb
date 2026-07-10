@@ -11,6 +11,7 @@ typedef enum {
     CMD_SI,
     CMD_N,
     CMD_UP,
+    CMD_KILL,
     CMD_REGS,
     CMD_SYMS,
     CMD_TB,

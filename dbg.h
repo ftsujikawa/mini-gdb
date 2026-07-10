@@ -254,6 +254,7 @@ const symbol_t *lookup_function_symbol(unsigned long addr);
 int update_load_base(void);
 
 void run_target(char *program);
+void kill_process(void);
 void show_regs(void);
 void show_backtrace(void);
 void single_step(void);

@@ -71,25 +71,26 @@ extern int cmdyydebug;
     T_SI = 264,                    /* T_SI  */
     T_N = 265,                     /* T_N  */
     T_UP = 266,                    /* T_UP  */
-    T_REGS = 267,                  /* T_REGS  */
-    T_SYMS = 268,                  /* T_SYMS  */
-    T_TB = 269,                    /* T_TB  */
-    T_L = 270,                     /* T_L  */
-    T_LIST = 271,                  /* T_LIST  */
-    T_DIS = 272,                   /* T_DIS  */
-    T_B = 273,                     /* T_B  */
-    T_BREAK = 274,                 /* T_BREAK  */
-    T_DEL = 275,                   /* T_DEL  */
-    T_DELETE = 276,                /* T_DELETE  */
-    T_SHOW = 277,                  /* T_SHOW  */
-    T_DBG = 278,                   /* T_DBG  */
-    T_LINES = 279,                 /* T_LINES  */
-    T_X = 280,                     /* T_X  */
-    T_P = 281,                     /* T_P  */
-    T_PRINT = 282,                 /* T_PRINT  */
-    T_SET = 283,                   /* T_SET  */
-    T_HELP = 284,                  /* T_HELP  */
-    T_Q = 285                      /* T_Q  */
+    T_KILL = 267,                  /* T_KILL  */
+    T_REGS = 268,                  /* T_REGS  */
+    T_SYMS = 269,                  /* T_SYMS  */
+    T_TB = 270,                    /* T_TB  */
+    T_L = 271,                     /* T_L  */
+    T_LIST = 272,                  /* T_LIST  */
+    T_DIS = 273,                   /* T_DIS  */
+    T_B = 274,                     /* T_B  */
+    T_BREAK = 275,                 /* T_BREAK  */
+    T_DEL = 276,                   /* T_DEL  */
+    T_DELETE = 277,                /* T_DELETE  */
+    T_SHOW = 278,                  /* T_SHOW  */
+    T_DBG = 279,                   /* T_DBG  */
+    T_LINES = 280,                 /* T_LINES  */
+    T_X = 281,                     /* T_X  */
+    T_P = 282,                     /* T_P  */
+    T_PRINT = 283,                 /* T_PRINT  */
+    T_SET = 284,                   /* T_SET  */
+    T_HELP = 285,                  /* T_HELP  */
+    T_Q = 286                      /* T_Q  */
   };
   typedef enum cmdyytokentype cmdyytoken_kind_t;
 #endif
@@ -102,7 +103,7 @@ union CMDYYSTYPE
 
     char *str;
 
-#line 106 "cmd_parser.h"
+#line 107 "cmd_parser.h"
 
 };
 typedef union CMDYYSTYPE CMDYYSTYPE;

@@ -36,6 +36,7 @@ EOL     (\r?\n)
 "s"                     return T_S;
 "n"                     return T_N;
 "up"                    return T_UP;
+"kill"                  return T_KILL;
 "regs"                  return T_REGS;
 "syms"                  return T_SYMS;
 "tb"                    return T_TB;

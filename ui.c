@@ -528,6 +528,7 @@ void show_help(void)
     printf("  si                         step one instruction\n");
     printf("  n                          step to next source line (steps over calls)\n");
     printf("  up                         run until current function returns\n");
+    printf("  kill                       terminate the debuggee (keeps tdb running)\n");
     printf("  b|break <loc>              set breakpoint (addr, symbol, file:line)\n");
     printf("  del|delete <num>           delete breakpoint by number\n");
     printf("  show bp                    list breakpoints\n");
@@ -586,6 +587,9 @@ void handle(char *line)
         break;
     case CMD_UP:
         finish_function();
+        break;
+    case CMD_KILL:
+        kill_process();
         break;
     case CMD_REGS:
         show_regs();

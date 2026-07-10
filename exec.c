@@ -604,6 +604,30 @@ int get_return_address(unsigned long *ret_addr)
 
 void continue_execution(void);
 
+void kill_process(void)
+{
+    if (!dbg.running) {
+        printf("no process\n");
+        return;
+    }
+
+    disarm_temp_breakpoint(&next_bp);
+    disarm_temp_breakpoint(&finish_bp);
+    disarm_temp_breakpoint(&step_over_bp);
+    heap_disarm_hooks();
+
+    kill(dbg.pid, SIGKILL);
+
+    int status;
+
+    do {
+        waitpid(dbg.pid, &status, 0);
+    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+
+    dbg.running = 0;
+    printf("[+] process killed (pid=%d)\n", dbg.pid);
+}
+
 void finish_function(void)
 {
     if (!dbg.running) {
