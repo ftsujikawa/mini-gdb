@@ -4,8 +4,10 @@ debugger_t dbg = {0};
 char debuggee_path[512];
 char debuggee_realpath[512];
 breakpoint_t breakpoints[MAX_BREAKPOINTS];
+watchpoint_t watchpoints[MAX_WATCHPOINTS];
 
 int bp_count = 0;
+int wp_count = 0;
 finish_bp_t finish_bp = {0};
 finish_bp_t next_bp = {0};
 symbol_t symbols[MAX_SYMBOLS];

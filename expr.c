@@ -836,6 +836,11 @@ static void print_eval_result(const eval_result_t *res, print_format_t fmt)
     print_value(res->label, val, fmt, res->type_off);
 }
 
+void print_watch_value(const char *label, unsigned long value, uint32_t type_off)
+{
+    print_value(label, value, PRINT_FMT_DEFAULT, type_off);
+}
+
 typedef enum {
     REG_KIND_GPR,      /* field in struct user_regs_struct, 8 bytes */
     REG_KIND_FPCTRL16, /* field in struct user_fpregs_struct, 2 bytes */
@@ -1756,6 +1761,26 @@ static int eval_lvalue_any(const char *expr, unsigned long rip, eval_result_t *r
 #endif
 }
 
+int resolve_lvalue(const char *expr, unsigned long rip,
+                    unsigned long *addr, uint32_t *type_off,
+                    char *label, size_t label_sz)
+{
+    eval_result_t res;
+
+    if (eval_lvalue_any(expr, rip, &res) != 0)
+        return -1;
+
+    *addr = res.addr;
+    *type_off = res.type_off;
+
+    if (label && label_sz) {
+        strncpy(label, res.label, label_sz - 1);
+        label[label_sz - 1] = '\0';
+    }
+
+    return 0;
+}
+
 static int expr_to_ulong_any(const c_expr_t *node, unsigned long *out)
 {
 #ifdef HAVE_EXPR_BISON
@@ -2486,6 +2511,11 @@ void show_command(const char *args)
         return;
     }
 
+    if (!strcmp(args, "watch") || !strcmp(args, "watchpoints")) {
+        show_watchpoints();
+        return;
+    }
+
     if (!strcmp(args, "locals")) {
         show_locals();
         return;
@@ -2515,6 +2545,7 @@ void show_command(const char *args)
     printf("  show language\n");
     printf("  show print\n");
     printf("  show bp\n");
+    printf("  show watch\n");
     printf("  show locals\n");
     printf("  show args\n");
     printf("  show globals\n");

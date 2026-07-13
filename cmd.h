@@ -12,6 +12,7 @@ typedef enum {
     CMD_N,
     CMD_UP,
     CMD_KILL,
+    CMD_WATCH,
     CMD_REGS,
     CMD_SYMS,
     CMD_TB,

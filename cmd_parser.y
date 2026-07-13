@@ -30,7 +30,7 @@ void cmdyyerror(const char *s);
 
 %token T_RUN T_C T_S T_SI T_N T_UP T_KILL T_REGS T_SYMS T_TB
 %token T_L T_LIST T_DIS T_B T_BREAK T_DEL T_DELETE T_SHOW T_DBG T_LINES T_X
-%token T_P T_PRINT T_SET
+%token T_P T_PRINT T_SET T_WATCH
 %token T_HELP T_Q
 
 %%
@@ -109,6 +109,9 @@ line
 
     | T_SET T_REST opt_eol
         { set_cmd(CMD_SET, $2); }
+
+    | T_WATCH T_REST opt_eol
+        { set_cmd(CMD_WATCH, $2); }
 
     | T_WORD T_EOL
         {

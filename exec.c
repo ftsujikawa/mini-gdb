@@ -38,6 +38,7 @@ void run_target(char *program)
 {
     dbg.is_pie = 0;
     dbg.load_base = 0;
+    wp_count = 0; /* hardware watchpoints don't survive across processes */
 
     pid_t pid = fork();
 
@@ -347,6 +348,238 @@ int delete_breakpoint(int num)
     return 0;
 }
 
+static long peek_debugreg(int i)
+{
+    return ptrace(PTRACE_PEEKUSER, dbg.pid,
+                  (void *)(offsetof(struct user, u_debugreg[0]) +
+                           (size_t)i * sizeof(unsigned long long)),
+                  0);
+}
+
+static int poke_debugreg(int i, unsigned long val)
+{
+    return ptrace(PTRACE_POKEUSER, dbg.pid,
+                  (void *)(offsetof(struct user, u_debugreg[0]) +
+                           (size_t)i * sizeof(unsigned long long)),
+                  (void *)val);
+}
+
+static long mask_for_size(int size, long value)
+{
+    if (size >= 8)
+        return value;
+
+    return value & ((1L << (size * 8)) - 1);
+}
+
+static int dr7_len_bits(int size)
+{
+    switch (size) {
+    case 1: return 0x0;
+    case 2: return 0x1;
+    case 8: return 0x2;
+    default: return 0x3; /* 4 bytes */
+    }
+}
+
+static int arm_watch_slot(int slot, unsigned long addr, int size)
+{
+    if (poke_debugreg(slot, addr) == -1) {
+        perror("ptrace poke debugreg");
+        return -1;
+    }
+
+    long dr7 = peek_debugreg(7);
+
+    if (dr7 == -1)
+        dr7 = 0;
+
+    dr7 &= ~(0x3L << (slot * 2));       /* clear L/G enable */
+    dr7 &= ~(0x3L << (16 + slot * 4));  /* clear R/W field */
+    dr7 &= ~(0x3L << (18 + slot * 4));  /* clear LEN field */
+
+    dr7 |= (0x1L << (slot * 2));        /* local enable */
+    dr7 |= (0x1L << (16 + slot * 4));   /* R/W = write */
+    dr7 |= ((long)dr7_len_bits(size) << (18 + slot * 4));
+
+    if (poke_debugreg(7, (unsigned long)dr7) == -1) {
+        perror("ptrace poke debugreg");
+        return -1;
+    }
+
+    return 0;
+}
+
+static void disarm_watch_slot(int slot)
+{
+    long dr7 = peek_debugreg(7);
+
+    if (dr7 == -1)
+        return;
+
+    dr7 &= ~(0x3L << (slot * 2));
+    poke_debugreg(7, (unsigned long)dr7);
+}
+
+void watch_command(const char *expr)
+{
+    if (!dbg.running) {
+        printf("no process\n");
+        return;
+    }
+
+    if (wp_count >= MAX_WATCHPOINTS) {
+        printf("too many watchpoints (max %d, hardware-limited)\n",
+               MAX_WATCHPOINTS);
+        return;
+    }
+
+    struct user_regs_struct regs;
+
+    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+
+    unsigned long addr;
+    uint32_t type_off;
+    char label[128];
+
+    if (resolve_lvalue(expr, regs.rip, &addr, &type_off,
+                        label, sizeof(label)) != 0) {
+        printf("cannot resolve: %s\n", expr);
+        return;
+    }
+
+    type_info_t ti = {
+        .kind = TYPE_BASE,
+        .size = 4,
+        .encoding = DW_ATE_signed,
+    };
+
+    if (type_off != 0)
+        get_cached_type(type_off, &ti);
+
+    int size = (int)ti.size;
+
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        printf("cannot watch value of size %d "
+               "(hardware watchpoints support 1, 2, 4, or 8 bytes)\n", size);
+        return;
+    }
+
+    int slot = wp_count;
+
+    if (arm_watch_slot(slot, addr, size) != 0)
+        return;
+
+    watchpoint_t *wp = &watchpoints[slot];
+
+    wp->enabled = 1;
+    wp->addr = addr;
+    wp->size = size;
+    wp->type_off = type_off;
+    wp->value = mask_for_size(size, read_memory(addr));
+    strncpy(wp->expr, label, sizeof(wp->expr) - 1);
+    wp->expr[sizeof(wp->expr) - 1] = '\0';
+
+    wp_count++;
+
+    printf("Hardware watchpoint %d: %s\n", wp_count, wp->expr);
+}
+
+void show_watchpoints(void)
+{
+    if (wp_count == 0) {
+        printf("no watchpoints\n");
+        return;
+    }
+
+    printf("Num  Enb  Address            Size  What\n");
+
+    for (int i = 0; i < wp_count; i++) {
+        watchpoint_t *wp = &watchpoints[i];
+
+        printf("%-4d %-4s 0x%-16lx %-5d %s\n",
+               i + 1,
+               wp->enabled ? "y" : "n",
+               wp->addr,
+               wp->size,
+               wp->expr);
+    }
+}
+
+int delete_watchpoint(int num)
+{
+    if (num < 1 || num > wp_count) {
+        printf("invalid watchpoint number: %d\n", num);
+        return -1;
+    }
+
+    disarm_watch_slot(num - 1);
+
+    /* Shift remaining watchpoints down a slot, re-arming each so its
+     * debug register index matches its new array position. */
+    for (int i = num - 1; i < wp_count - 1; i++) {
+        watchpoints[i] = watchpoints[i + 1];
+        arm_watch_slot(i, watchpoints[i].addr, watchpoints[i].size);
+    }
+
+    disarm_watch_slot(wp_count - 1);
+    wp_count--;
+    printf("Watchpoint %d deleted\n", num);
+    return 0;
+}
+
+/* Checks the debug-register status (DR6) for a hardware watchpoint hit.
+ * Returns 0 if this trap wasn't caused by a watchpoint, 1 if a watched
+ * value actually changed (already reported; caller should stop), or 2
+ * if a watchpoint fired but the value is unchanged (caller should
+ * silently resume, mirroring heap-hook transparency). */
+static int check_watchpoints(struct user_regs_struct *regs)
+{
+    if (wp_count == 0)
+        return 0;
+
+    long dr6 = peek_debugreg(6);
+
+    if (dr6 == -1)
+        return 0;
+
+    /* Bits 0-3 (B0-B3) flag which slot triggered; bits 4-13 are reserved
+     * and hard-wired to 1 by the CPU, so they must be masked out or
+     * every trap (INT3, single-step, ...) would look like a hit here. */
+    long hit_mask = dr6 & 0xFL;
+
+    if (hit_mask == 0)
+        return 0;
+
+    int changed = 0;
+
+    for (int i = 0; i < wp_count; i++) {
+        if (!(hit_mask & (1L << i)) || !watchpoints[i].enabled)
+            continue;
+
+        watchpoint_t *wp = &watchpoints[i];
+        long new_value = mask_for_size(wp->size, read_memory(wp->addr));
+
+        if (new_value == wp->value)
+            continue;
+
+        printf("\nHardware watchpoint %d: %s\n\n", i + 1, wp->expr);
+        print_watch_value("Old value", (unsigned long)wp->value, wp->type_off);
+        print_watch_value("New value", (unsigned long)new_value, wp->type_off);
+        wp->value = new_value;
+        changed = 1;
+    }
+
+    poke_debugreg(6, 0);
+
+    if (changed) {
+        show_stop_location(regs->rip);
+        return 1;
+    }
+
+    return 2;
+}
+
 int restore_breakpoint(breakpoint_t *bp)
 {
     if (ptrace(
@@ -624,6 +857,7 @@ void kill_process(void)
         waitpid(dbg.pid, &status, 0);
     } while (!WIFEXITED(status) && !WIFSIGNALED(status));
 
+    wp_count = 0;
     dbg.running = 0;
     printf("[+] process killed (pid=%d)\n", dbg.pid);
 }
@@ -816,6 +1050,8 @@ void continue_execution()
             disarm_temp_breakpoint(&step_over_bp);
             heap_on_process_exit();
             heap_disarm_hooks();
+            wp_count = 0; /* debug registers are per-process; the dead
+                           * tracee's slots no longer exist */
             printf("[+] process exited\n");
             dbg.running = 0;
             return;
@@ -851,6 +1087,13 @@ void continue_execution()
             0,
             &regs
         );
+
+        int wp_status = check_watchpoints(&regs);
+
+        if (wp_status == 1)
+            return;
+        if (wp_status == 2)
+            continue;
 
         if (heap_handle_finish_trap(&regs))
             continue;

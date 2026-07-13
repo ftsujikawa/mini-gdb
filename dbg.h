@@ -43,6 +43,22 @@ typedef struct {
 extern breakpoint_t breakpoints[MAX_BREAKPOINTS];
 extern int bp_count;
 
+/* Hardware watchpoints, backed by the x86 debug registers (DR0-DR3), so
+ * at most 4 can be active at once. */
+#define MAX_WATCHPOINTS 4
+
+typedef struct {
+    int enabled;
+    unsigned long addr;
+    int size;
+    uint32_t type_off;
+    long value;
+    char expr[128];
+} watchpoint_t;
+
+extern watchpoint_t watchpoints[MAX_WATCHPOINTS];
+extern int wp_count;
+
 typedef struct {
     int active;
     int uses_existing;
@@ -244,6 +260,13 @@ int eval_expression_bison(const char *expr, unsigned long rip, expr_bison_c_expr
 int eval_lvalue_bison(const char *expr, unsigned long rip, expr_bison_eval_result_t *res);
 int expr_to_ulong_bison(const expr_bison_c_expr_t *node, unsigned long *out);
 
+/* Resolves an lvalue expression to an address/type, regardless of which
+ * expression evaluator (hand-written or bison) the build uses. */
+int resolve_lvalue(const char *expr, unsigned long rip,
+                    unsigned long *addr, uint32_t *type_off,
+                    char *label, size_t label_sz);
+void print_watch_value(const char *label, unsigned long value, uint32_t type_off);
+
 void load_symbols(char *path);
 void show_symbols(void);
 int lookup_symbol(const char *name, unsigned long *addr);
@@ -264,6 +287,10 @@ void show_breakpoints(void);
 int delete_breakpoint(int num);
 breakpoint_t *find_breakpoint(unsigned long addr);
 breakpoint_t *find_breakpoint_by_rip(unsigned long rip);
+
+void watch_command(const char *expr);
+void show_watchpoints(void);
+int delete_watchpoint(int num);
 int restore_breakpoint(breakpoint_t *bp);
 int enable_breakpoint(breakpoint_t *bp);
 void rewind_rip(unsigned long addr);

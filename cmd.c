@@ -121,6 +121,9 @@ int cmd_parse_line(const char *line, cmd_t *out,
         out->kind = CMD_UP;
     } else if (!strcmp(cmd, "kill")) {
         out->kind = CMD_KILL;
+    } else if (!strcmp(cmd, "watch")) {
+        out->kind = CMD_WATCH;
+        out->arg = dup_str(tmp);
     } else if (!strcmp(cmd, "regs")) {
         out->kind = CMD_REGS;
     } else if (!strcmp(cmd, "syms")) {

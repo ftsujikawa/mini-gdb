@@ -530,8 +530,11 @@ void show_help(void)
     printf("  up                         run until current function returns\n");
     printf("  kill                       terminate the debuggee (keeps tdb running)\n");
     printf("  b|break <loc>              set breakpoint (addr, symbol, file:line)\n");
+    printf("  watch <expr>               set hardware watchpoint (stop on value change)\n");
     printf("  del|delete <num>           delete breakpoint by number\n");
+    printf("  del|delete w<num>          delete watchpoint by number\n");
     printf("  show bp                    list breakpoints\n");
+    printf("  show watch                 list watchpoints\n");
     printf("  p|print [/fmt] <expr>      evaluate and print an expression\n");
     printf("  set <name> = <value>       assign variable, register, or setting\n");
     printf("  set $<reg> = <expr>        gpr/eflags/fctrl/fstat/ftag/fop/mxcsr\n");
@@ -590,6 +593,12 @@ void handle(char *line)
         break;
     case CMD_KILL:
         kill_process();
+        break;
+    case CMD_WATCH:
+        if (!cmd.arg || !cmd.arg[0])
+            printf("usage: watch <expr>\n");
+        else
+            watch_command(cmd.arg);
         break;
     case CMD_REGS:
         show_regs();
@@ -670,16 +679,21 @@ void handle(char *line)
     }
     case CMD_DEL: {
         char *arg = cmd.arg ? cmd.arg : "";
+        int is_watch = (arg[0] == 'w' || arg[0] == 'W');
         char *end;
-        long num = strtol(arg, &end, 10);
+        long num = strtol(is_watch ? arg + 1 : arg, &end, 10);
 
-        if (*end != '\0' || end == arg || num <= 0) {
+        if (*end != '\0' || end == (is_watch ? arg + 1 : arg) || num <= 0) {
             printf("usage: del|delete <breakpoint-number>\n");
-            printf("       (use 'show b' to list breakpoints)\n");
+            printf("       del|delete w<watchpoint-number>\n");
+            printf("       (use 'show bp'/'show watch' to list them)\n");
             break;
         }
 
-        delete_breakpoint((int)num);
+        if (is_watch)
+            delete_watchpoint((int)num);
+        else
+            delete_breakpoint((int)num);
         break;
     }
     case CMD_SHOW:

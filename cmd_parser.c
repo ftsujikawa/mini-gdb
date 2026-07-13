@@ -153,12 +153,13 @@ enum yysymbol_kind_t
   YYSYMBOL_T_P = 27,                       /* T_P  */
   YYSYMBOL_T_PRINT = 28,                   /* T_PRINT  */
   YYSYMBOL_T_SET = 29,                     /* T_SET  */
-  YYSYMBOL_T_HELP = 30,                    /* T_HELP  */
-  YYSYMBOL_T_Q = 31,                       /* T_Q  */
-  YYSYMBOL_YYACCEPT = 32,                  /* $accept  */
-  YYSYMBOL_input = 33,                     /* input  */
-  YYSYMBOL_opt_eol = 34,                   /* opt_eol  */
-  YYSYMBOL_line = 35                       /* line  */
+  YYSYMBOL_T_WATCH = 30,                   /* T_WATCH  */
+  YYSYMBOL_T_HELP = 31,                    /* T_HELP  */
+  YYSYMBOL_T_Q = 32,                       /* T_Q  */
+  YYSYMBOL_YYACCEPT = 33,                  /* $accept  */
+  YYSYMBOL_input = 34,                     /* input  */
+  YYSYMBOL_opt_eol = 35,                   /* opt_eol  */
+  YYSYMBOL_line = 36                       /* line  */
 };
 typedef enum yysymbol_kind_t yysymbol_kind_t;
 
@@ -484,21 +485,21 @@ union yyalloc
 #endif /* !YYCOPY_NEEDED */
 
 /* YYFINAL -- State number of the termination state.  */
-#define YYFINAL  58
+#define YYFINAL  60
 /* YYLAST -- Last index in YYTABLE.  */
-#define YYLAST   72
+#define YYLAST   75
 
 /* YYNTOKENS -- Number of terminals.  */
-#define YYNTOKENS  32
+#define YYNTOKENS  33
 /* YYNNTS -- Number of nonterminals.  */
 #define YYNNTS  4
 /* YYNRULES -- Number of rules.  */
-#define YYNRULES  32
+#define YYNRULES  33
 /* YYNSTATES -- Number of states.  */
-#define YYNSTATES  75
+#define YYNSTATES  78
 
 /* YYMAXUTOK -- Last valid token kind.  */
-#define YYMAXUTOK   286
+#define YYMAXUTOK   287
 
 
 /* YYTRANSLATE(TOKEN-NUM) -- Symbol number corresponding to TOKEN-NUM
@@ -540,7 +541,7 @@ static const yytype_int8 yytranslate[] =
        2,     2,     2,     2,     2,     2,     1,     2,     3,     4,
        5,     6,     7,     8,     9,    10,    11,    12,    13,    14,
       15,    16,    17,    18,    19,    20,    21,    22,    23,    24,
-      25,    26,    27,    28,    29,    30,    31
+      25,    26,    27,    28,    29,    30,    31,    32
 };
 
 #if CMDYYDEBUG
@@ -550,7 +551,7 @@ static const yytype_int8 yyrline[] =
        0,    39,    39,    43,    44,    48,    50,    52,    54,    56,
       58,    60,    62,    64,    66,    68,    70,    72,    75,    77,
       80,    83,    85,    88,    90,    93,    96,    99,   102,   105,
-     107,   110,   113
+     107,   110,   113,   116
 };
 #endif
 
@@ -570,8 +571,8 @@ static const char *const yytname[] =
   "T_REST", "T_RUN", "T_C", "T_S", "T_SI", "T_N", "T_UP", "T_KILL",
   "T_REGS", "T_SYMS", "T_TB", "T_L", "T_LIST", "T_DIS", "T_B", "T_BREAK",
   "T_DEL", "T_DELETE", "T_SHOW", "T_DBG", "T_LINES", "T_X", "T_P",
-  "T_PRINT", "T_SET", "T_HELP", "T_Q", "$accept", "input", "opt_eol",
-  "line", YY_NULLPTR
+  "T_PRINT", "T_SET", "T_WATCH", "T_HELP", "T_Q", "$accept", "input",
+  "opt_eol", "line", YY_NULLPTR
 };
 
 static const char *
@@ -595,14 +596,14 @@ yysymbol_name (yysymbol_kind_t yysymbol)
    STATE-NUM.  */
 static const yytype_int8 yypact[] =
 {
-      -3,   -15,    -1,    38,    40,    41,    42,    43,    44,    45,
-      46,    47,    48,    49,    50,    51,    52,    53,    54,    55,
-      56,    57,    58,    59,    60,    61,    62,    65,    66,    70,
-     -15,   -15,    68,   -15,   -15,   -15,   -15,   -15,   -15,   -15,
-     -15,   -15,    69,    69,    69,    69,    69,    69,    69,    69,
-      69,    69,    69,    69,    69,    69,   -15,   -15,   -15,   -15,
+      -3,   -15,    -1,    40,    42,    43,    44,    45,    46,    47,
+      48,    49,    50,    51,    52,    53,    54,    55,    56,    57,
+      58,    59,    60,    61,    62,    63,    64,    65,    68,    69,
+      73,   -15,   -15,    71,   -15,   -15,   -15,   -15,   -15,   -15,
+     -15,   -15,   -15,    72,    72,    72,    72,    72,    72,    72,
+      72,    72,    72,    72,    72,    72,    72,    72,   -15,   -15,
      -15,   -15,   -15,   -15,   -15,   -15,   -15,   -15,   -15,   -15,
-     -15,   -15,   -15,   -15,   -15
+     -15,   -15,   -15,   -15,   -15,   -15,   -15,   -15
 };
 
 /* YYDEFACT[STATE-NUM] -- Default reduction number in state STATE-NUM.
@@ -613,11 +614,11 @@ static const yytype_int8 yydefact[] =
        0,     5,     0,     0,     0,     0,     0,     0,     0,     0,
        0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
        0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
-       2,    32,     0,     7,     8,     9,    10,    11,    12,    13,
-      14,    15,     3,     3,     3,     3,     3,     3,     3,     3,
-       3,     3,     3,     3,     3,     3,    16,    17,     1,     6,
-       4,    18,    19,    20,    21,    22,    23,    24,    25,    26,
-      27,    28,    29,    30,    31
+       0,     2,    33,     0,     7,     8,     9,    10,    11,    12,
+      13,    14,    15,     3,     3,     3,     3,     3,     3,     3,
+       3,     3,     3,     3,     3,     3,     3,     3,    16,    17,
+       1,     6,     4,    18,    19,    20,    21,    22,    23,    24,
+      25,    26,    27,    28,    29,    30,    31,    32
 };
 
 /* YYPGOTO[NTERM-NUM].  */
@@ -629,7 +630,7 @@ static const yytype_int8 yypgoto[] =
 /* YYDEFGOTO[NTERM-NUM].  */
 static const yytype_int8 yydefgoto[] =
 {
-       0,    29,    61,    30
+       0,    30,    63,    31
 };
 
 /* YYTABLE[YYPACT[STATE-NUM]] -- What to do in state STATE-NUM.  If
@@ -637,26 +638,26 @@ static const yytype_int8 yydefgoto[] =
    number is the opposite.  If YYTABLE_NINF, syntax error.  */
 static const yytype_int8 yytable[] =
 {
-       1,     2,    31,     3,     4,     5,     6,     7,     8,     9,
+       1,     2,    32,     3,     4,     5,     6,     7,     8,     9,
       10,    11,    12,    13,    14,    15,    16,    17,    18,    19,
-      20,    21,    22,    23,    24,    25,    26,    27,    28,    62,
-      63,    64,    65,    66,    67,    68,    69,    70,    71,    72,
-      73,    74,    32,    33,    34,    35,    36,    37,    38,    39,
-      40,    41,     0,     0,    42,    43,    44,    45,    46,    47,
-      48,    49,    50,    51,    52,    53,    54,    55,    56,    57,
-      58,    59,    60
+      20,    21,    22,    23,    24,    25,    26,    27,    28,    29,
+      64,    65,    66,    67,    68,    69,    70,    71,    72,    73,
+      74,    75,    76,    77,    33,    34,    35,    36,    37,    38,
+      39,    40,    41,    42,     0,     0,    43,    44,    45,    46,
+      47,    48,    49,    50,    51,    52,    53,    54,    55,    56,
+      57,    58,    59,    60,    61,    62
 };
 
 static const yytype_int8 yycheck[] =
 {
        3,     4,     3,     6,     7,     8,     9,    10,    11,    12,
       13,    14,    15,    16,    17,    18,    19,    20,    21,    22,
-      23,    24,    25,    26,    27,    28,    29,    30,    31,    43,
+      23,    24,    25,    26,    27,    28,    29,    30,    31,    32,
       44,    45,    46,    47,    48,    49,    50,    51,    52,    53,
-      54,    55,     4,     3,     3,     3,     3,     3,     3,     3,
-       3,     3,    -1,    -1,     5,     5,     5,     5,     5,     5,
-       5,     5,     5,     5,     5,     5,     5,     5,     3,     3,
-       0,     3,     3
+      54,    55,    56,    57,     4,     3,     3,     3,     3,     3,
+       3,     3,     3,     3,    -1,    -1,     5,     5,     5,     5,
+       5,     5,     5,     5,     5,     5,     5,     5,     5,     5,
+       5,     3,     3,     0,     3,     3
 };
 
 /* YYSTOS[STATE-NUM] -- The symbol kind of the accessing symbol of
@@ -665,21 +666,21 @@ static const yytype_int8 yystos[] =
 {
        0,     3,     4,     6,     7,     8,     9,    10,    11,    12,
       13,    14,    15,    16,    17,    18,    19,    20,    21,    22,
-      23,    24,    25,    26,    27,    28,    29,    30,    31,    33,
-      35,     3,     4,     3,     3,     3,     3,     3,     3,     3,
-       3,     3,     5,     5,     5,     5,     5,     5,     5,     5,
-       5,     5,     5,     5,     5,     5,     3,     3,     0,     3,
-       3,    34,    34,    34,    34,    34,    34,    34,    34,    34,
-      34,    34,    34,    34,    34
+      23,    24,    25,    26,    27,    28,    29,    30,    31,    32,
+      34,    36,     3,     4,     3,     3,     3,     3,     3,     3,
+       3,     3,     3,     5,     5,     5,     5,     5,     5,     5,
+       5,     5,     5,     5,     5,     5,     5,     5,     3,     3,
+       0,     3,     3,    35,    35,    35,    35,    35,    35,    35,
+      35,    35,    35,    35,    35,    35,    35,    35
 };
 
 /* YYR1[RULE-NUM] -- Symbol kind of the left-hand side of rule RULE-NUM.  */
 static const yytype_int8 yyr1[] =
 {
-       0,    32,    33,    34,    34,    35,    35,    35,    35,    35,
-      35,    35,    35,    35,    35,    35,    35,    35,    35,    35,
-      35,    35,    35,    35,    35,    35,    35,    35,    35,    35,
-      35,    35,    35
+       0,    33,    34,    35,    35,    36,    36,    36,    36,    36,
+      36,    36,    36,    36,    36,    36,    36,    36,    36,    36,
+      36,    36,    36,    36,    36,    36,    36,    36,    36,    36,
+      36,    36,    36,    36
 };
 
 /* YYR2[RULE-NUM] -- Number of symbols on the right-hand side of rule RULE-NUM.  */
@@ -688,7 +689,7 @@ static const yytype_int8 yyr2[] =
        0,     2,     1,     0,     1,     1,     3,     2,     2,     2,
        2,     2,     2,     2,     2,     2,     2,     2,     3,     3,
        3,     3,     3,     3,     3,     3,     3,     3,     3,     3,
-       3,     3,     2
+       3,     3,     3,     2
 };
 
 
@@ -1154,178 +1155,184 @@ yyreduce:
   case 5: /* line: T_EOL  */
 #line 49 "cmd_parser.y"
         { set_cmd(CMD_INVALID, NULL); }
-#line 1158 "cmd_parser.c"
+#line 1159 "cmd_parser.c"
     break;
 
   case 6: /* line: T_RUN T_WORD T_EOL  */
 #line 51 "cmd_parser.y"
         { set_cmd(CMD_RUN, (yyvsp[-1].str)); }
-#line 1164 "cmd_parser.c"
+#line 1165 "cmd_parser.c"
     break;
 
   case 7: /* line: T_C T_EOL  */
 #line 53 "cmd_parser.y"
         { set_cmd(CMD_C, NULL); }
-#line 1170 "cmd_parser.c"
+#line 1171 "cmd_parser.c"
     break;
 
   case 8: /* line: T_S T_EOL  */
 #line 55 "cmd_parser.y"
         { set_cmd(CMD_S, NULL); }
-#line 1176 "cmd_parser.c"
+#line 1177 "cmd_parser.c"
     break;
 
   case 9: /* line: T_SI T_EOL  */
 #line 57 "cmd_parser.y"
         { set_cmd(CMD_SI, NULL); }
-#line 1182 "cmd_parser.c"
+#line 1183 "cmd_parser.c"
     break;
 
   case 10: /* line: T_N T_EOL  */
 #line 59 "cmd_parser.y"
         { set_cmd(CMD_N, NULL); }
-#line 1188 "cmd_parser.c"
+#line 1189 "cmd_parser.c"
     break;
 
   case 11: /* line: T_UP T_EOL  */
 #line 61 "cmd_parser.y"
         { set_cmd(CMD_UP, NULL); }
-#line 1194 "cmd_parser.c"
+#line 1195 "cmd_parser.c"
     break;
 
   case 12: /* line: T_KILL T_EOL  */
 #line 63 "cmd_parser.y"
         { set_cmd(CMD_KILL, NULL); }
-#line 1200 "cmd_parser.c"
+#line 1201 "cmd_parser.c"
     break;
 
   case 13: /* line: T_REGS T_EOL  */
 #line 65 "cmd_parser.y"
         { set_cmd(CMD_REGS, NULL); }
-#line 1206 "cmd_parser.c"
+#line 1207 "cmd_parser.c"
     break;
 
   case 14: /* line: T_SYMS T_EOL  */
 #line 67 "cmd_parser.y"
         { set_cmd(CMD_SYMS, NULL); }
-#line 1212 "cmd_parser.c"
+#line 1213 "cmd_parser.c"
     break;
 
   case 15: /* line: T_TB T_EOL  */
 #line 69 "cmd_parser.y"
         { set_cmd(CMD_TB, NULL); }
-#line 1218 "cmd_parser.c"
+#line 1219 "cmd_parser.c"
     break;
 
   case 16: /* line: T_HELP T_EOL  */
 #line 71 "cmd_parser.y"
         { set_cmd(CMD_HELP, NULL); }
-#line 1224 "cmd_parser.c"
+#line 1225 "cmd_parser.c"
     break;
 
   case 17: /* line: T_Q T_EOL  */
 #line 73 "cmd_parser.y"
         { set_cmd(CMD_QUIT, NULL); }
-#line 1230 "cmd_parser.c"
+#line 1231 "cmd_parser.c"
     break;
 
   case 18: /* line: T_L T_REST opt_eol  */
 #line 76 "cmd_parser.y"
         { set_cmd(CMD_LIST, (yyvsp[-1].str)); }
-#line 1236 "cmd_parser.c"
+#line 1237 "cmd_parser.c"
     break;
 
   case 19: /* line: T_LIST T_REST opt_eol  */
 #line 78 "cmd_parser.y"
         { set_cmd(CMD_LIST, (yyvsp[-1].str)); }
-#line 1242 "cmd_parser.c"
+#line 1243 "cmd_parser.c"
     break;
 
   case 20: /* line: T_DIS T_REST opt_eol  */
 #line 81 "cmd_parser.y"
         { set_cmd(CMD_DIS, (yyvsp[-1].str)); }
-#line 1248 "cmd_parser.c"
+#line 1249 "cmd_parser.c"
     break;
 
   case 21: /* line: T_B T_REST opt_eol  */
 #line 84 "cmd_parser.y"
         { set_cmd(CMD_BREAK, (yyvsp[-1].str)); }
-#line 1254 "cmd_parser.c"
+#line 1255 "cmd_parser.c"
     break;
 
   case 22: /* line: T_BREAK T_REST opt_eol  */
 #line 86 "cmd_parser.y"
         { set_cmd(CMD_BREAK, (yyvsp[-1].str)); }
-#line 1260 "cmd_parser.c"
+#line 1261 "cmd_parser.c"
     break;
 
   case 23: /* line: T_DEL T_REST opt_eol  */
 #line 89 "cmd_parser.y"
         { set_cmd(CMD_DEL, (yyvsp[-1].str)); }
-#line 1266 "cmd_parser.c"
+#line 1267 "cmd_parser.c"
     break;
 
   case 24: /* line: T_DELETE T_REST opt_eol  */
 #line 91 "cmd_parser.y"
         { set_cmd(CMD_DEL, (yyvsp[-1].str)); }
-#line 1272 "cmd_parser.c"
+#line 1273 "cmd_parser.c"
     break;
 
   case 25: /* line: T_SHOW T_REST opt_eol  */
 #line 94 "cmd_parser.y"
         { set_cmd(CMD_SHOW, (yyvsp[-1].str)); }
-#line 1278 "cmd_parser.c"
+#line 1279 "cmd_parser.c"
     break;
 
   case 26: /* line: T_DBG T_REST opt_eol  */
 #line 97 "cmd_parser.y"
         { set_cmd(CMD_DBG, (yyvsp[-1].str)); }
-#line 1284 "cmd_parser.c"
+#line 1285 "cmd_parser.c"
     break;
 
   case 27: /* line: T_LINES T_REST opt_eol  */
 #line 100 "cmd_parser.y"
         { set_cmd(CMD_LINES, (yyvsp[-1].str)); }
-#line 1290 "cmd_parser.c"
+#line 1291 "cmd_parser.c"
     break;
 
   case 28: /* line: T_X T_REST opt_eol  */
 #line 103 "cmd_parser.y"
         { set_cmd(CMD_X, (yyvsp[-1].str)); }
-#line 1296 "cmd_parser.c"
+#line 1297 "cmd_parser.c"
     break;
 
   case 29: /* line: T_P T_REST opt_eol  */
 #line 106 "cmd_parser.y"
         { set_cmd(CMD_PRINT, (yyvsp[-1].str)); }
-#line 1302 "cmd_parser.c"
+#line 1303 "cmd_parser.c"
     break;
 
   case 30: /* line: T_PRINT T_REST opt_eol  */
 #line 108 "cmd_parser.y"
         { set_cmd(CMD_PRINT, (yyvsp[-1].str)); }
-#line 1308 "cmd_parser.c"
+#line 1309 "cmd_parser.c"
     break;
 
   case 31: /* line: T_SET T_REST opt_eol  */
 #line 111 "cmd_parser.y"
         { set_cmd(CMD_SET, (yyvsp[-1].str)); }
-#line 1314 "cmd_parser.c"
+#line 1315 "cmd_parser.c"
     break;
 
-  case 32: /* line: T_WORD T_EOL  */
+  case 32: /* line: T_WATCH T_REST opt_eol  */
 #line 114 "cmd_parser.y"
+        { set_cmd(CMD_WATCH, (yyvsp[-1].str)); }
+#line 1321 "cmd_parser.c"
+    break;
+
+  case 33: /* line: T_WORD T_EOL  */
+#line 117 "cmd_parser.y"
         {
             free((yyvsp[-1].str));
             snprintf(cmd_parse_error, sizeof(cmd_parse_error),
                      "unknown command");
             YYABORT;
         }
-#line 1325 "cmd_parser.c"
+#line 1332 "cmd_parser.c"
     break;
 
 
-#line 1329 "cmd_parser.c"
+#line 1336 "cmd_parser.c"
 
       default: break;
     }
@@ -1518,7 +1525,7 @@ yyreturnlab:
   return yyresult;
 }
 
-#line 122 "cmd_parser.y"
+#line 125 "cmd_parser.y"
 
 
 void cmdyyerror(const char *s)

@@ -54,6 +54,7 @@ EOL     (\r?\n)
 "print"                 { BEGIN(ARG); return T_PRINT; }
 "p"                     { BEGIN(ARG); return T_P; }
 "set"                   { BEGIN(ARG); return T_SET; }
+"watch"                 { BEGIN(ARG); return T_WATCH; }
 "help"                  return T_HELP;
 "q"                     return T_Q;
 [^ \t\r\n]+             { cmdyylval.str = dup_yytext(); return T_WORD; }
