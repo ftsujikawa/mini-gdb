@@ -530,7 +530,8 @@ void show_help(void)
     printf("  up                         run until current function returns\n");
     printf("  kill                       terminate the debuggee (keeps tdb running)\n");
     printf("  b|break <loc>              set breakpoint (addr, symbol, file:line)\n");
-    printf("  watch <expr>               set hardware watchpoint (stop on value change)\n");
+    printf("  watch [/r] [/1|2|4|8] <expr>  hardware watchpoint (write, or /r for read/write;\n");
+    printf("                             size auto-detected or overridden by /1,/2,/4,/8)\n");
     printf("  del|delete <num>           delete breakpoint by number\n");
     printf("  del|delete w<num>          delete watchpoint by number\n");
     printf("  show bp                    list breakpoints\n");
@@ -596,7 +597,7 @@ void handle(char *line)
         break;
     case CMD_WATCH:
         if (!cmd.arg || !cmd.arg[0])
-            printf("usage: watch <expr>\n");
+            printf("usage: watch [/r] [/1|/2|/4|/8] <expr>\n");
         else
             watch_command(cmd.arg);
         break;

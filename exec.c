@@ -382,7 +382,8 @@ static int dr7_len_bits(int size)
     }
 }
 
-static int arm_watch_slot(int slot, unsigned long addr, int size)
+static int arm_watch_slot(int slot, unsigned long addr, int size,
+                           int access_mode)
 {
     if (poke_debugreg(slot, addr) == -1) {
         perror("ptrace poke debugreg");
@@ -394,12 +395,17 @@ static int arm_watch_slot(int slot, unsigned long addr, int size)
     if (dr7 == -1)
         dr7 = 0;
 
+    /* R/W field: 0b01 = break on writes only, 0b11 = break on any
+     * read or write access. x86 has no pure read-only mode, so /r
+     * (access_mode) uses 0b11 like gdb's `awatch`. */
+    long rw = access_mode ? 0x3L : 0x1L;
+
     dr7 &= ~(0x3L << (slot * 2));       /* clear L/G enable */
     dr7 &= ~(0x3L << (16 + slot * 4));  /* clear R/W field */
     dr7 &= ~(0x3L << (18 + slot * 4));  /* clear LEN field */
 
     dr7 |= (0x1L << (slot * 2));        /* local enable */
-    dr7 |= (0x1L << (16 + slot * 4));   /* R/W = write */
+    dr7 |= (rw << (16 + slot * 4));
     dr7 |= ((long)dr7_len_bits(size) << (18 + slot * 4));
 
     if (poke_debugreg(7, (unsigned long)dr7) == -1) {
@@ -421,7 +427,56 @@ static void disarm_watch_slot(int slot)
     poke_debugreg(7, (unsigned long)dr7);
 }
 
-void watch_command(const char *expr)
+/* Parses leading "/r" and "/1"|"/2"|"/4"|"/8" flag tokens (in either
+ * order, combined like "/r4" or separate like "/r /4") off the front of
+ * a `watch` argument string. Returns a pointer to the remaining
+ * expression text, or NULL (after printing a usage message) if an
+ * unrecognized flag character was found. */
+static const char *parse_watch_flags(const char *args, int *access_mode,
+                                      int *size_override)
+{
+    *access_mode = 0;
+    *size_override = 0;
+
+    while (*args == ' ' || *args == '\t')
+        args++;
+
+    while (*args == '/') {
+        args++;
+
+        while (*args && *args != ' ' && *args != '\t') {
+            switch (*args) {
+            case 'r':
+            case 'R':
+                *access_mode = 1;
+                break;
+            case '1':
+                *size_override = 1;
+                break;
+            case '2':
+                *size_override = 2;
+                break;
+            case '4':
+                *size_override = 4;
+                break;
+            case '8':
+                *size_override = 8;
+                break;
+            default:
+                printf("usage: watch [/r] [/1|/2|/4|/8] <expr>\n");
+                return NULL;
+            }
+            args++;
+        }
+
+        while (*args == ' ' || *args == '\t')
+            args++;
+    }
+
+    return args;
+}
+
+void watch_command(const char *args)
 {
     if (!dbg.running) {
         printf("no process\n");
@@ -431,6 +486,18 @@ void watch_command(const char *expr)
     if (wp_count >= MAX_WATCHPOINTS) {
         printf("too many watchpoints (max %d, hardware-limited)\n",
                MAX_WATCHPOINTS);
+        return;
+    }
+
+    int access_mode;
+    int size_override;
+    const char *expr = parse_watch_flags(args, &access_mode, &size_override);
+
+    if (!expr)
+        return;
+
+    if (!*expr) {
+        printf("usage: watch [/r] [/1|/2|/4|/8] <expr>\n");
         return;
     }
 
@@ -448,26 +515,31 @@ void watch_command(const char *expr)
         return;
     }
 
-    type_info_t ti = {
-        .kind = TYPE_BASE,
-        .size = 4,
-        .encoding = DW_ATE_signed,
-    };
+    int size = size_override;
 
-    if (type_off != 0)
-        get_cached_type(type_off, &ti);
+    if (size == 0) {
+        type_info_t ti = {
+            .kind = TYPE_BASE,
+            .size = 4,
+            .encoding = DW_ATE_signed,
+        };
 
-    int size = (int)ti.size;
+        if (type_off != 0)
+            get_cached_type(type_off, &ti);
 
-    if (size != 1 && size != 2 && size != 4 && size != 8) {
-        printf("cannot watch value of size %d "
-               "(hardware watchpoints support 1, 2, 4, or 8 bytes)\n", size);
-        return;
+        size = (int)ti.size;
+
+        if (size != 1 && size != 2 && size != 4 && size != 8) {
+            printf("cannot watch value of size %d (hardware watchpoints "
+                   "support 1, 2, 4, or 8 bytes; use /1, /2, /4, or /8 "
+                   "to override)\n", size);
+            return;
+        }
     }
 
     int slot = wp_count;
 
-    if (arm_watch_slot(slot, addr, size) != 0)
+    if (arm_watch_slot(slot, addr, size, access_mode) != 0)
         return;
 
     watchpoint_t *wp = &watchpoints[slot];
@@ -475,6 +547,7 @@ void watch_command(const char *expr)
     wp->enabled = 1;
     wp->addr = addr;
     wp->size = size;
+    wp->access_mode = access_mode;
     wp->type_off = type_off;
     wp->value = mask_for_size(size, read_memory(addr));
     strncpy(wp->expr, label, sizeof(wp->expr) - 1);
@@ -482,7 +555,8 @@ void watch_command(const char *expr)
 
     wp_count++;
 
-    printf("Hardware watchpoint %d: %s\n", wp_count, wp->expr);
+    printf("Hardware %swatchpoint %d: %s\n",
+           access_mode ? "access (read/write) " : "", wp_count, wp->expr);
 }
 
 void show_watchpoints(void)
@@ -492,16 +566,17 @@ void show_watchpoints(void)
         return;
     }
 
-    printf("Num  Enb  Address            Size  What\n");
+    printf("Num  Enb  Address            Size  Mode   What\n");
 
     for (int i = 0; i < wp_count; i++) {
         watchpoint_t *wp = &watchpoints[i];
 
-        printf("%-4d %-4s 0x%-16lx %-5d %s\n",
+        printf("%-4d %-4s 0x%-16lx %-5d %-6s %s\n",
                i + 1,
                wp->enabled ? "y" : "n",
                wp->addr,
                wp->size,
+               wp->access_mode ? "rw" : "w",
                wp->expr);
     }
 }
@@ -519,7 +594,8 @@ int delete_watchpoint(int num)
      * debug register index matches its new array position. */
     for (int i = num - 1; i < wp_count - 1; i++) {
         watchpoints[i] = watchpoints[i + 1];
-        arm_watch_slot(i, watchpoints[i].addr, watchpoints[i].size);
+        arm_watch_slot(i, watchpoints[i].addr, watchpoints[i].size,
+                       watchpoints[i].access_mode);
     }
 
     disarm_watch_slot(wp_count - 1);
@@ -559,11 +635,19 @@ static int check_watchpoints(struct user_regs_struct *regs)
 
         watchpoint_t *wp = &watchpoints[i];
         long new_value = mask_for_size(wp->size, read_memory(wp->addr));
+        int value_changed = (new_value != wp->value);
 
-        if (new_value == wp->value)
+        /* A write-only watchpoint that fires with no actual value
+         * change is spurious (e.g. the same value rewritten) and is
+         * silently skipped, like gdb does. An access watchpoint (/r)
+         * must still be reported on a bare read, which by definition
+         * never changes the value, so it is always reported instead. */
+        if (!wp->access_mode && !value_changed)
             continue;
 
-        printf("\nHardware watchpoint %d: %s\n\n", i + 1, wp->expr);
+        printf("\nHardware %swatchpoint %d: %s\n\n",
+               wp->access_mode ? "access (read/write) " : "",
+               i + 1, wp->expr);
         print_watch_value("Old value", (unsigned long)wp->value, wp->type_off);
         print_watch_value("New value", (unsigned long)new_value, wp->type_off);
         wp->value = new_value;

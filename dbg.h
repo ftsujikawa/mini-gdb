@@ -51,6 +51,7 @@ typedef struct {
     int enabled;
     unsigned long addr;
     int size;
+    int access_mode; /* 0 = write-only, 1 = read/write access (/r) */
     uint32_t type_off;
     long value;
     char expr[128];
