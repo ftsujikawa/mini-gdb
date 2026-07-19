@@ -185,8 +185,9 @@ void show_threads(void)
     printf("   Id  Tid      Location\n");
 
     for (int i = 0; i < thread_count; i++) {
-        printf("%s  %-3d %-8d ",
+        printf("%s%s %-3d %-8d ",
                threads[i].tid == dbg.current_tid ? "*" : " ",
+               locked_tid != 0 && threads[i].tid == locked_tid ? "L" : " ",
                i + 1,
                threads[i].tid);
 
@@ -216,6 +217,9 @@ void show_threads(void)
 
         printf("\n");
     }
+
+    if (locked_tid != 0)
+        printf("(L = locked; only this tid runs on `c`)\n");
 }
 
 int switch_thread(int num)
@@ -278,6 +282,13 @@ void single_step()
         return;
     }
 
+    if (locked_tid != 0 && dbg.current_tid != locked_tid) {
+        printf("current thread (tid=%d) is not the locked thread "
+               "(locked to tid=%d); use `thread` to switch back or "
+               "`unlock`\n", dbg.current_tid, locked_tid);
+        return;
+    }
+
     ptrace(
         PTRACE_SINGLESTEP,
         dbg.current_tid,
@@ -312,6 +323,13 @@ void source_step()
 {
     if (!dbg.running) {
         printf("no process\n");
+        return;
+    }
+
+    if (locked_tid != 0 && dbg.current_tid != locked_tid) {
+        printf("current thread (tid=%d) is not the locked thread "
+               "(locked to tid=%d); use `thread` to switch back or "
+               "`unlock`\n", dbg.current_tid, locked_tid);
         return;
     }
 
@@ -1217,6 +1235,13 @@ void finish_function(void)
         return;
     }
 
+    if (locked_tid != 0 && dbg.current_tid != locked_tid) {
+        printf("current thread (tid=%d) is not the locked thread "
+               "(locked to tid=%d); use `thread` to switch back or "
+               "`unlock`\n", dbg.current_tid, locked_tid);
+        return;
+    }
+
     unsigned long ret_addr;
 
     if (get_return_address(&ret_addr) != 0) {
@@ -1270,6 +1295,13 @@ void next_line(void)
 
     if (next_bp.active) {
         printf("already stepping to next line\n");
+        return;
+    }
+
+    if (locked_tid != 0 && dbg.current_tid != locked_tid) {
+        printf("current thread (tid=%d) is not the locked thread "
+               "(locked to tid=%d); use `thread` to switch back or "
+               "`unlock`\n", dbg.current_tid, locked_tid);
         return;
     }
 
@@ -1502,13 +1534,14 @@ void continue_execution()
     }
 
     for (int i = 0; i < thread_count; i++) {
-        /* Under a scheduler lock, only the locked tid (and whichever
-         * tid is currently selected, so an internal step-over-a-call
-         * sub-continue from next_line can't deadlock) get resumed;
-         * every other thread is left stopped. */
-        if (locked_tid != 0 &&
-            threads[i].tid != locked_tid &&
-            threads[i].tid != dbg.current_tid)
+        /* Under a scheduler lock, only the locked tid gets resumed;
+         * every other thread is left stopped, with no exception for
+         * whatever tid happens to be currently selected. Callers that
+         * drive continue_execution() for a non-locked tid (next_line's
+         * step-over-a-call, finish_function) must check the lock
+         * themselves before ever getting here, or this would deadlock
+         * waiting for a thread that never resumes. */
+        if (locked_tid != 0 && threads[i].tid != locked_tid)
             continue;
 
         ptrace(PTRACE_CONT, threads[i].tid, 0, 0);
@@ -1592,8 +1625,7 @@ void continue_execution()
                  * spawned while locked to a different tid must not
                  * start running either. It stays registered but
                  * stopped until `unlock` (or a lock on this tid). */
-                if (locked_tid == 0 || tid == locked_tid ||
-                    tid == dbg.current_tid) {
+                if (locked_tid == 0 || tid == locked_tid) {
                     ptrace(PTRACE_CONT, tid, 0, 0);
                     threads[idx].running = 1;
                 }
