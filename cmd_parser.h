@@ -90,8 +90,10 @@ extern int cmdyydebug;
     T_PRINT = 283,                 /* T_PRINT  */
     T_SET = 284,                   /* T_SET  */
     T_WATCH = 285,                 /* T_WATCH  */
-    T_HELP = 286,                  /* T_HELP  */
-    T_Q = 287                      /* T_Q  */
+    T_THREADS = 286,               /* T_THREADS  */
+    T_THREAD = 287,                /* T_THREAD  */
+    T_HELP = 288,                  /* T_HELP  */
+    T_Q = 289                      /* T_Q  */
   };
   typedef enum cmdyytokentype cmdyytoken_kind_t;
 #endif
@@ -104,7 +106,7 @@ union CMDYYSTYPE
 
     char *str;
 
-#line 108 "cmd_parser.h"
+#line 110 "cmd_parser.h"
 
 };
 typedef union CMDYYSTYPE CMDYYSTYPE;

@@ -64,7 +64,7 @@ static const char *current_source_file(void)
         const char *file;
         int line;
 
-        if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == 0 &&
+        if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == 0 &&
             lookup_line(regs.rip, &file, &line) == 0)
             return file;
     }
@@ -102,7 +102,7 @@ void list_source(const char *arg)
         if (dbg.running) {
             struct user_regs_struct regs;
 
-            if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == 0 &&
+            if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == 0 &&
                 lookup_line(regs.rip, &file, &line) == 0) {
                 list_source_at(file, line);
                 return;
@@ -225,9 +225,10 @@ void show_stop_location(unsigned long pc)
     const char *file;
     int line;
 
-    /* This debugger only ever tracks a single (main) thread, whose tid
-     * equals its pid, so both are reported from dbg.pid. */
-    printf("[+] pid=%d tid=%d\n", dbg.pid, dbg.pid);
+    /* dbg.pid is the thread group id (main thread); dbg.current_tid is
+     * whichever thread this stop actually pertains to (may differ once
+     * the debuggee has spawned additional threads). */
+    printf("[+] pid=%d tid=%d\n", dbg.pid, dbg.current_tid);
 
     if (lookup_line(pc, &file, &line) == 0) {
         printf("=> %s:%d\n", file, line);
@@ -386,7 +387,7 @@ void show_regs()
 
     struct user_regs_struct regs;
 
-    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+    if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == -1) {
         perror("ptrace getregs");
         return;
     }
@@ -422,7 +423,7 @@ void show_regs()
 
     struct user_fpregs_struct fpregs;
 
-    if (ptrace(PTRACE_GETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+    if (ptrace(PTRACE_GETFPREGS, dbg.current_tid, 0, &fpregs) == -1) {
         perror("ptrace getfpregs");
         return;
     }
@@ -489,7 +490,7 @@ void show_backtrace(void)
 
     struct user_regs_struct regs;
 
-    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+    if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == -1) {
         perror("ptrace getregs");
         return;
     }
@@ -529,6 +530,8 @@ void show_help(void)
     printf("  n                          step to next source line (steps over calls)\n");
     printf("  up                         run until current function returns\n");
     printf("  kill                       terminate the debuggee (keeps tdb running)\n");
+    printf("  threads                    list threads in the debuggee\n");
+    printf("  thread <num>               switch regs/step/bt/print to that thread\n");
     printf("  b|break <loc>              set breakpoint (addr, symbol, file:line)\n");
     printf("  watch [/r] [/N] <expr>     hw watchpoint; /r=read+write, /N=size(1,2,4,8)\n");
     printf("  del|delete <num>           delete breakpoint by number\n");
@@ -600,6 +603,23 @@ void handle(char *line)
         else
             watch_command(cmd.arg);
         break;
+    case CMD_THREADS:
+        show_threads();
+        break;
+    case CMD_THREAD: {
+        char *arg = cmd.arg ? cmd.arg : "";
+        char *end;
+        long num = strtol(arg, &end, 10);
+
+        if (*end != '\0' || end == arg || num <= 0) {
+            printf("usage: thread <num>\n");
+            printf("       (use 'threads' to list them)\n");
+            break;
+        }
+
+        switch_thread((int)num);
+        break;
+    }
     case CMD_REGS:
         show_regs();
         break;

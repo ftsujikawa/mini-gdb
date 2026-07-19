@@ -359,7 +359,7 @@ static int read_var_addr(const char *name,
     if (v) {
         struct user_regs_struct regs;
 
-        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+        ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
 
         if (v->loc == VAR_FBREG)
             *addr_out = regs.rbp + 16 + v->fbreg;
@@ -1008,7 +1008,7 @@ static int ep_parse_register(ep_t *ep, c_expr_t *out)
 
     struct user_regs_struct regs;
 
-    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+    if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == -1) {
         perror("ptrace getregs");
         return -1;
     }
@@ -1951,7 +1951,7 @@ static int set_register_value(const char *args, unsigned long rip)
         if (end != rhs && *end == '\0') {
             struct user_fpregs_struct fpregs;
 
-            if (ptrace(PTRACE_GETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+            if (ptrace(PTRACE_GETFPREGS, dbg.current_tid, 0, &fpregs) == -1) {
                 perror("ptrace getfpregs");
                 return 1;
             }
@@ -1970,7 +1970,7 @@ static int set_register_value(const char *args, unsigned long rip)
                        sizeof(dval));
             }
 
-            if (ptrace(PTRACE_SETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+            if (ptrace(PTRACE_SETFPREGS, dbg.current_tid, 0, &fpregs) == -1) {
                 perror("ptrace setfpregs");
                 return 1;
             }
@@ -1990,14 +1990,14 @@ static int set_register_value(const char *args, unsigned long rip)
     if (reg->kind == REG_KIND_GPR) {
         struct user_regs_struct regs;
 
-        if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+        if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == -1) {
             perror("ptrace getregs");
             return 1;
         }
 
         *(unsigned long long *)((char *)&regs + reg->offset) = rawval;
 
-        if (ptrace(PTRACE_SETREGS, dbg.pid, 0, &regs) == -1) {
+        if (ptrace(PTRACE_SETREGS, dbg.current_tid, 0, &regs) == -1) {
             perror("ptrace setregs");
             return 1;
         }
@@ -2008,7 +2008,7 @@ static int set_register_value(const char *args, unsigned long rip)
 
     struct user_fpregs_struct fpregs;
 
-    if (ptrace(PTRACE_GETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+    if (ptrace(PTRACE_GETFPREGS, dbg.current_tid, 0, &fpregs) == -1) {
         perror("ptrace getfpregs");
         return 1;
     }
@@ -2037,7 +2037,7 @@ static int set_register_value(const char *args, unsigned long rip)
         break;
     }
 
-    if (ptrace(PTRACE_SETFPREGS, dbg.pid, 0, &fpregs) == -1) {
+    if (ptrace(PTRACE_SETFPREGS, dbg.current_tid, 0, &fpregs) == -1) {
         perror("ptrace setfpregs");
         return 1;
     }
@@ -2298,7 +2298,7 @@ void set_command(const char *args)
 
         struct user_regs_struct regs;
 
-        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+        ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
 
         if (set_register_value(args, regs.rip))
             return;
@@ -2335,7 +2335,7 @@ static void var_entry_to_result(const var_entry_t *v, eval_result_t *res)
 {
     struct user_regs_struct regs;
 
-    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+    ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
 
     if (v->loc == VAR_FBREG)
         res->addr = regs.rbp + 16 + v->fbreg;
@@ -2356,7 +2356,7 @@ static void show_scoped_vars(var_kind_t kind, const char *label)
 
     struct user_regs_struct regs;
 
-    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+    if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == -1) {
         perror("ptrace getregs");
         return;
     }
@@ -2588,7 +2588,7 @@ void print_expression(const char *expr)
 
     struct user_regs_struct regs;
 
-    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+    ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
 
     c_expr_t node;
 

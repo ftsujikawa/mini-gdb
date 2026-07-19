@@ -1265,7 +1265,7 @@ static unsigned long dbg_current_rip(void)
 
     struct user_regs_struct regs;
 
-    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1)
+    if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == -1)
         return 0;
 
     return regs.rip;

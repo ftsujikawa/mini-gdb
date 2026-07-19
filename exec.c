@@ -1,11 +1,15 @@
 #include "dbg.h"
 #include "heap.h"
 
+#include <sys/syscall.h>
+
 #define PTRACE_EVENT_EXEC 4
+#define PTRACE_EVENT_CLONE 3
 
 static int wait_for_exec(pid_t pid)
 {
-    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACEEXEC);
+    ptrace(PTRACE_SETOPTIONS, pid, 0,
+           PTRACE_O_TRACEEXEC | PTRACE_O_TRACECLONE);
 
     for (int i = 0; i < 5; i++) {
         if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
@@ -86,6 +90,11 @@ void run_target(char *program)
     }
 
     dbg.running = 1;
+    dbg.current_tid = pid;
+    thread_count = 1;
+    threads[0].tid = pid;
+    threads[0].active = 1;
+    threads[0].running = 0;
 
     heap_reset();
     if (heap_trace_enabled())
@@ -93,6 +102,88 @@ void run_target(char *program)
 
     printf("[+] process started pid=%d\n", pid);
 }
+
+static int find_thread_index(pid_t tid)
+{
+    for (int i = 0; i < thread_count; i++) {
+        if (threads[i].active && threads[i].tid == tid)
+            return i;
+    }
+
+    return -1;
+}
+
+static int add_thread(pid_t tid)
+{
+    if (find_thread_index(tid) >= 0)
+        return 0;
+
+    if (thread_count >= MAX_THREADS) {
+        printf("[-] too many threads (max %d), not tracking tid=%d\n",
+               MAX_THREADS, tid);
+        return -1;
+    }
+
+    threads[thread_count].tid = tid;
+    threads[thread_count].active = 1;
+    threads[thread_count].running = 0;
+    thread_count++;
+    return 0;
+}
+
+/* Removes a thread that has exited. If it was the current thread,
+ * falls back to whichever thread is now first in the table. */
+static void remove_thread(pid_t tid)
+{
+    int idx = find_thread_index(tid);
+
+    if (idx < 0)
+        return;
+
+    for (int i = idx; i < thread_count - 1; i++)
+        threads[i] = threads[i + 1];
+
+    thread_count--;
+
+    if (dbg.current_tid == tid && thread_count > 0)
+        dbg.current_tid = threads[0].tid;
+}
+
+void show_threads(void)
+{
+    if (thread_count == 0) {
+        printf("no threads\n");
+        return;
+    }
+
+    printf("   Id  Tid\n");
+
+    for (int i = 0; i < thread_count; i++) {
+        printf("%s  %-3d %d\n",
+               threads[i].tid == dbg.current_tid ? "*" : " ",
+               i + 1,
+               threads[i].tid);
+    }
+}
+
+int switch_thread(int num)
+{
+    if (num < 1 || num > thread_count) {
+        printf("invalid thread number: %d\n", num);
+        return -1;
+    }
+
+    dbg.current_tid = threads[num - 1].tid;
+    printf("[+] switched to thread %d (tid=%d)\n", num, dbg.current_tid);
+
+    struct user_regs_struct regs;
+
+    if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == 0)
+        show_stop_location(regs.rip);
+
+    return 0;
+}
+
 void single_step()
 {
     if (!dbg.running) {
@@ -102,7 +193,7 @@ void single_step()
 
     ptrace(
         PTRACE_SINGLESTEP,
-        dbg.pid,
+        dbg.current_tid,
         0,
         0
     );
@@ -110,7 +201,7 @@ void single_step()
     int status;
 
     waitpid(
-        dbg.pid,
+        dbg.current_tid,
         &status,
         0
     );
@@ -124,7 +215,7 @@ void single_step()
     if (WIFSTOPPED(status)) {
         struct user_regs_struct regs;
 
-        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+        ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
         printf("[+] stepped\n");
         show_pc_location(regs.rip);
     }
@@ -141,7 +232,7 @@ void source_step()
     const char *start_file;
     int start_line;
 
-    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+    ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
 
     if (lookup_line(regs.rip, &start_file, &start_line) != 0) {
         single_step();
@@ -150,7 +241,7 @@ void source_step()
 
     for (int i = 0; i < 10000; i++) {
         if (ptrace(PTRACE_SINGLESTEP,
-                   dbg.pid,
+                   dbg.current_tid,
                    0,
                    0) == -1) {
             perror("ptrace singlestep");
@@ -159,7 +250,7 @@ void source_step()
 
         int status;
 
-        if (waitpid(dbg.pid, &status, 0) < 0) {
+        if (waitpid(dbg.current_tid, &status, 0) < 0) {
             perror("waitpid");
             return;
         }
@@ -173,7 +264,7 @@ void source_step()
         if (!WIFSTOPPED(status))
             continue;
 
-        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+        ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
 
         const char *file;
         int line;
@@ -348,17 +439,19 @@ int delete_breakpoint(int num)
     return 0;
 }
 
-static long peek_debugreg(int i)
+/* Debug registers (DR0-DR7) are per-thread CPU state, not process-wide,
+ * so every caller must specify which tid it is reading/writing. */
+static long peek_debugreg(pid_t tid, int i)
 {
-    return ptrace(PTRACE_PEEKUSER, dbg.pid,
+    return ptrace(PTRACE_PEEKUSER, tid,
                   (void *)(offsetof(struct user, u_debugreg[0]) +
                            (size_t)i * sizeof(unsigned long long)),
                   0);
 }
 
-static int poke_debugreg(int i, unsigned long val)
+static int poke_debugreg(pid_t tid, int i, unsigned long val)
 {
-    return ptrace(PTRACE_POKEUSER, dbg.pid,
+    return ptrace(PTRACE_POKEUSER, tid,
                   (void *)(offsetof(struct user, u_debugreg[0]) +
                            (size_t)i * sizeof(unsigned long long)),
                   (void *)val);
@@ -382,15 +475,15 @@ static int dr7_len_bits(int size)
     }
 }
 
-static int arm_watch_slot(int slot, unsigned long addr, int size,
+static int arm_watch_slot(pid_t tid, int slot, unsigned long addr, int size,
                            int access_mode)
 {
-    if (poke_debugreg(slot, addr) == -1) {
+    if (poke_debugreg(tid, slot, addr) == -1) {
         perror("ptrace poke debugreg");
         return -1;
     }
 
-    long dr7 = peek_debugreg(7);
+    long dr7 = peek_debugreg(tid, 7);
 
     if (dr7 == -1)
         dr7 = 0;
@@ -408,7 +501,7 @@ static int arm_watch_slot(int slot, unsigned long addr, int size,
     dr7 |= (rw << (16 + slot * 4));
     dr7 |= ((long)dr7_len_bits(size) << (18 + slot * 4));
 
-    if (poke_debugreg(7, (unsigned long)dr7) == -1) {
+    if (poke_debugreg(tid, 7, (unsigned long)dr7) == -1) {
         perror("ptrace poke debugreg");
         return -1;
     }
@@ -416,15 +509,28 @@ static int arm_watch_slot(int slot, unsigned long addr, int size,
     return 0;
 }
 
-static void disarm_watch_slot(int slot)
+static void disarm_watch_slot(pid_t tid, int slot)
 {
-    long dr7 = peek_debugreg(7);
+    long dr7 = peek_debugreg(tid, 7);
 
     if (dr7 == -1)
         return;
 
     dr7 &= ~(0x3L << (slot * 2));
-    poke_debugreg(7, (unsigned long)dr7);
+    poke_debugreg(tid, 7, (unsigned long)dr7);
+}
+
+/* Applies every currently-armed watchpoint's debug-register state to a
+ * newly created thread, so hardware watchpoints (which are per-thread)
+ * keep covering the whole process rather than just the thread that was
+ * current when `watch` was issued. */
+static void propagate_watchpoints_to_thread(pid_t tid)
+{
+    for (int i = 0; i < wp_count; i++) {
+        if (watchpoints[i].enabled)
+            arm_watch_slot(tid, i, watchpoints[i].addr,
+                           watchpoints[i].size, watchpoints[i].access_mode);
+    }
 }
 
 /* Parses leading "/r" and "/1"|"/2"|"/4"|"/8" flag tokens (in either
@@ -503,7 +609,7 @@ void watch_command(const char *args)
 
     struct user_regs_struct regs;
 
-    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+    ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
 
     unsigned long addr;
     uint32_t type_off;
@@ -539,8 +645,15 @@ void watch_command(const char *args)
 
     int slot = wp_count;
 
-    if (arm_watch_slot(slot, addr, size, access_mode) != 0)
-        return;
+    /* A watchpoint covers the whole process, not just the thread that
+     * was current when it was set, so every thread's debug registers
+     * for this slot must be armed (new threads pick it up via
+     * propagate_watchpoints_to_thread when they are created). */
+    for (int i = 0; i < thread_count; i++) {
+        if (arm_watch_slot(threads[i].tid, slot, addr, size,
+                           access_mode) != 0)
+            return;
+    }
 
     watchpoint_t *wp = &watchpoints[slot];
 
@@ -588,17 +701,23 @@ int delete_watchpoint(int num)
         return -1;
     }
 
-    disarm_watch_slot(num - 1);
+    for (int t = 0; t < thread_count; t++)
+        disarm_watch_slot(threads[t].tid, num - 1);
 
-    /* Shift remaining watchpoints down a slot, re-arming each so its
-     * debug register index matches its new array position. */
+    /* Shift remaining watchpoints down a slot, re-arming each (on every
+     * thread) so its debug register index matches its new array
+     * position. */
     for (int i = num - 1; i < wp_count - 1; i++) {
         watchpoints[i] = watchpoints[i + 1];
-        arm_watch_slot(i, watchpoints[i].addr, watchpoints[i].size,
-                       watchpoints[i].access_mode);
+
+        for (int t = 0; t < thread_count; t++)
+            arm_watch_slot(threads[t].tid, i, watchpoints[i].addr,
+                           watchpoints[i].size, watchpoints[i].access_mode);
     }
 
-    disarm_watch_slot(wp_count - 1);
+    for (int t = 0; t < thread_count; t++)
+        disarm_watch_slot(threads[t].tid, wp_count - 1);
+
     wp_count--;
     printf("Watchpoint %d deleted\n", num);
     return 0;
@@ -609,12 +728,12 @@ int delete_watchpoint(int num)
  * value actually changed (already reported; caller should stop), or 2
  * if a watchpoint fired but the value is unchanged (caller should
  * silently resume, mirroring heap-hook transparency). */
-static int check_watchpoints(struct user_regs_struct *regs)
+static int check_watchpoints(pid_t tid, struct user_regs_struct *regs)
 {
     if (wp_count == 0)
         return 0;
 
-    long dr6 = peek_debugreg(6);
+    long dr6 = peek_debugreg(tid, 6);
 
     if (dr6 == -1)
         return 0;
@@ -634,7 +753,7 @@ static int check_watchpoints(struct user_regs_struct *regs)
             continue;
 
         watchpoint_t *wp = &watchpoints[i];
-        long new_value = mask_for_size(wp->size, read_memory(wp->addr));
+        long new_value = mask_for_size(wp->size, read_memory_tid(tid, wp->addr));
         int value_changed = (new_value != wp->value);
 
         /* A write-only watchpoint that fires with no actual value
@@ -654,7 +773,7 @@ static int check_watchpoints(struct user_regs_struct *regs)
         changed = 1;
     }
 
-    poke_debugreg(6, 0);
+    poke_debugreg(tid, 6, 0);
 
     if (changed) {
         show_stop_location(regs->rip);
@@ -664,11 +783,11 @@ static int check_watchpoints(struct user_regs_struct *regs)
     return 2;
 }
 
-int restore_breakpoint(breakpoint_t *bp)
+int restore_breakpoint_tid(pid_t tid, breakpoint_t *bp)
 {
     if (ptrace(
             PTRACE_POKEDATA,
-            dbg.pid,
+            tid,
             (void*)bp->addr,
             (void*)bp->original_data
         ) == -1) {
@@ -679,14 +798,19 @@ int restore_breakpoint(breakpoint_t *bp)
     return 0;
 }
 
-int enable_breakpoint(breakpoint_t *bp)
+int restore_breakpoint(breakpoint_t *bp)
+{
+    return restore_breakpoint_tid(dbg.pid, bp);
+}
+
+int enable_breakpoint_tid(pid_t tid, breakpoint_t *bp)
 {
     long patched =
         (bp->original_data & ~0xff) | 0xcc;
 
     if (ptrace(
             PTRACE_POKEDATA,
-            dbg.pid,
+            tid,
             (void*)bp->addr,
             (void*)patched
         ) == -1) {
@@ -697,13 +821,18 @@ int enable_breakpoint(breakpoint_t *bp)
     return 0;
 }
 
-void rewind_rip(unsigned long addr)
+int enable_breakpoint(breakpoint_t *bp)
+{
+    return enable_breakpoint_tid(dbg.pid, bp);
+}
+
+void rewind_rip(pid_t tid, unsigned long addr)
 {
     struct user_regs_struct regs;
 
     ptrace(
         PTRACE_GETREGS,
-        dbg.pid,
+        tid,
         0,
         &regs
     );
@@ -712,63 +841,82 @@ void rewind_rip(unsigned long addr)
 
     ptrace(
         PTRACE_SETREGS,
-        dbg.pid,
+        tid,
         0,
         &regs
     );
 }
 
-int step_over_breakpoint(breakpoint_t *bp)
+int step_over_breakpoint(pid_t tid, breakpoint_t *bp)
 {
     /*
       restore original instruction
     */
 
-    if (restore_breakpoint(bp) != 0)
+    if (restore_breakpoint_tid(tid, bp) != 0)
         return -1;
 
     /*
       RIP = original address
     */
 
-    rewind_rip(bp->addr);
+    rewind_rip(tid, bp->addr);
 
     /*
-      execute 1 instruction
-    */
+     * Execute exactly 1 instruction. A signal queued for this tid from
+     * elsewhere (e.g. the directed SIGSTOP sent by
+     * sync_stop_other_threads for all-stop synchronization) can preempt
+     * the singlestep: the tracee re-stops immediately without actually
+     * executing anything, rip unchanged. Since rip is already known-good
+     * (just rewound above) and the INT3 has already been removed, it is
+     * always safe to just retry in that case.
+     */
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (ptrace(
+                PTRACE_SINGLESTEP,
+                tid,
+                0,
+                0
+            ) == -1) {
+            perror("ptrace singlestep");
+            enable_breakpoint_tid(tid, bp);
+            return -1;
+        }
 
-    if (ptrace(
-            PTRACE_SINGLESTEP,
-            dbg.pid,
-            0,
-            0
-        ) == -1) {
-        perror("ptrace singlestep");
-        return -1;
-    }
+        int status;
 
-    int status;
+        if (waitpid(
+                tid,
+                &status,
+                __WALL
+            ) < 0) {
+            perror("waitpid");
+            return -1;
+        }
 
-    if (waitpid(
-            dbg.pid,
-            &status,
-            0
-        ) < 0) {
-        perror("waitpid");
-        return -1;
-    }
+        if (WIFEXITED(status)) {
+            printf("[+] process exited\n");
+            dbg.running = 0;
+            return -1;
+        }
 
-    if (WIFEXITED(status)) {
-        printf("[+] process exited\n");
-        dbg.running = 0;
-        return -1;
+        if (!WIFSTOPPED(status))
+            continue;
+
+        struct user_regs_struct regs;
+
+        if (ptrace(PTRACE_GETREGS, tid, 0, &regs) == 0 &&
+            regs.rip != bp->addr)
+            break; /* actually advanced past the original instruction */
+
+        /* Preempted before the instruction executed; retry. */
     }
 
     /*
       put INT3 back
     */
 
-    if (enable_breakpoint(bp) != 0)
+    if (enable_breakpoint_tid(tid, bp) != 0)
         return -1;
 
     return 0;
@@ -837,9 +985,13 @@ static void disarm_temp_breakpoint(finish_bp_t *tp)
 static unsigned long handle_temp_stop(finish_bp_t *tp)
 {
     if (!tp->uses_existing) {
+        /* dbg.current_tid, not dbg.pid: this restore always concerns
+         * whichever thread is being stepped/finished, which may not be
+         * the main thread (and may be the only one currently stopped
+         * at this point, before sync_stop_other_threads runs). */
         ptrace(
             PTRACE_POKEDATA,
-            dbg.pid,
+            dbg.current_tid,
             (void *)tp->addr,
             (void *)tp->original_data
         );
@@ -847,7 +999,7 @@ static unsigned long handle_temp_stop(finish_bp_t *tp)
 
     unsigned long addr = tp->addr;
 
-    rewind_rip(addr);
+    rewind_rip(dbg.current_tid, addr);
     tp->active = 0;
 
     return addr;
@@ -873,7 +1025,7 @@ int get_return_address(unsigned long *ret_addr)
 {
     struct user_regs_struct regs;
 
-    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+    ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
 
     unsigned long debug_rip = to_debug_addr(regs.rip);
     unsigned long func_start = 0;
@@ -935,13 +1087,27 @@ void kill_process(void)
 
     kill(dbg.pid, SIGKILL);
 
-    int status;
+    /* SIGKILL brings down the whole thread group, but each thread still
+     * produces its own wait event; reap all of them so none are left as
+     * zombies. */
+    int remaining = thread_count;
 
-    do {
-        waitpid(dbg.pid, &status, 0);
-    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+    while (remaining > 0) {
+        int status;
+        pid_t tid = waitpid(-1, &status, __WALL);
+
+        if (tid == -1) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+
+        if (WIFEXITED(status) || WIFSIGNALED(status))
+            remaining--;
+    }
 
     wp_count = 0;
+    thread_count = 0;
     dbg.running = 0;
     printf("[+] process killed (pid=%d)\n", dbg.pid);
 }
@@ -1019,9 +1185,10 @@ void next_line(void)
         return;
     }
 
+    pid_t tid = dbg.current_tid;
     struct user_regs_struct regs;
 
-    ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+    ptrace(PTRACE_GETREGS, tid, 0, &regs);
 
     const char *start_file;
     int start_line;
@@ -1036,14 +1203,14 @@ void next_line(void)
     for (int i = 0; i < 100000; i++) {
         int is_call = insn_is_call(regs.rip);
 
-        if (ptrace(PTRACE_SINGLESTEP, dbg.pid, 0, 0) == -1) {
+        if (ptrace(PTRACE_SINGLESTEP, tid, 0, 0) == -1) {
             perror("ptrace singlestep");
             return;
         }
 
         int status;
 
-        if (waitpid(dbg.pid, &status, 0) < 0) {
+        if (waitpid(tid, &status, 0) < 0) {
             perror("waitpid");
             return;
         }
@@ -1057,7 +1224,7 @@ void next_line(void)
         if (!WIFSTOPPED(status))
             continue;
 
-        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+        ptrace(PTRACE_GETREGS, tid, 0, &regs);
 
         if (is_call) {
             /* Just entered a callee: run to its return address instead
@@ -1074,7 +1241,16 @@ void next_line(void)
                 if (!dbg.running)
                     return;
 
-                ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+                if (dbg.current_tid != tid) {
+                    /* A different thread reported a real stop event
+                     * (breakpoint/watchpoint/signal) during the call
+                     * skip and already took over the prompt; end this
+                     * `next` here too. */
+                    disarm_temp_breakpoint(&step_over_bp);
+                    return;
+                }
+
+                ptrace(PTRACE_GETREGS, tid, 0, &regs);
 
                 if (regs.rip != (unsigned long long)ret_addr) {
                     /* continue_execution stopped at some other event
@@ -1106,6 +1282,130 @@ void next_line(void)
     printf("next line limit reached\n");
 }
 
+/* If `tid` is currently parked right after a real breakpoint's INT3, steps
+ * it over properly (restore original bytes, replay the real instruction,
+ * re-arm the INT3) so it is never left sitting mid-instruction - which
+ * would corrupt its execution the next time it resumes (the breakpoint
+ * may since have been deleted, restoring the original bytes while this
+ * tid's rip is still one byte into them). Safe to call for any tid that
+ * is currently ptrace-stopped, known to us or not. Returns 1 if a
+ * breakpoint was found and handled (which also consumes/retries past any
+ * signal that was queued for this tid), 0 if it wasn't parked on one. */
+static int step_over_if_pending_breakpoint(pid_t tid)
+{
+    struct user_regs_struct regs;
+
+    if (ptrace(PTRACE_GETREGS, tid, 0, &regs) != 0)
+        return 0;
+
+    breakpoint_t *bp = find_breakpoint_by_rip(regs.rip);
+
+    if (!bp)
+        return 0;
+
+    step_over_breakpoint(tid, bp);
+    return 1;
+}
+
+/* All-stop synchronization: once one thread has a genuine stop event to
+ * report, every other still-running thread is forced to stop too (via a
+ * directed SIGSTOP) so the whole process is halted at the prompt, matching
+ * gdb's default all-stop behavior. Their individual stop reasons are not
+ * processed here; the user can inspect them with `threads`/`thread <n>`. */
+static void sync_stop_other_threads(pid_t stopped_tid)
+{
+    int pending = 0;
+
+    for (int i = 0; i < thread_count; i++) {
+        if (threads[i].tid == stopped_tid) {
+            threads[i].running = 0;
+            continue;
+        }
+
+        if (threads[i].running) {
+            syscall(SYS_tgkill, dbg.pid, threads[i].tid, SIGSTOP);
+            pending++;
+        }
+    }
+
+    while (pending > 0) {
+        int status;
+        pid_t tid;
+
+        do {
+            tid = waitpid(-1, &status, __WALL);
+        } while (tid == -1 && errno == EINTR);
+
+        if (tid == -1)
+            break;
+
+        int idx = find_thread_index(tid);
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (idx >= 0 && threads[idx].running)
+                pending--;
+            if (tid != dbg.pid)
+                remove_thread(tid);
+            continue;
+        }
+
+        if (!WIFSTOPPED(status))
+            continue;
+
+        int sig = WSTOPSIG(status);
+
+        if (idx < 0) {
+            /* Thread not yet registered - its parent's clone
+             * notification hasn't reached the main dispatch loop yet.
+             * Register it now and make sure it isn't left parked
+             * mid-breakpoint; it never counted against `pending` since
+             * we never explicitly stopped it. */
+            add_thread(tid);
+
+            if (sig != SIGSTOP)
+                step_over_if_pending_breakpoint(tid);
+
+            continue;
+        }
+
+        if (!threads[idx].running)
+            continue;
+
+        threads[idx].running = 0;
+        pending--;
+
+        if (sig != SIGSTOP) {
+            /* This thread stopped for its own reason (e.g. it hit the
+             * same breakpoint/watchpoint at nearly the same moment as
+             * stopped_tid), not because of the SIGSTOP just sent to
+             * it. If it was parked on a breakpoint, step_over_* has
+             * already internally retried past any preemption from that
+             * queued SIGSTOP, so nothing more is needed - the thread is
+             * left properly stopped. Otherwise, the SIGSTOP is still
+             * queued and would otherwise fire as a spurious stop right
+             * after this thread is next resumed, so resume-and-reabsorb
+             * it explicitly here instead. */
+            if (!step_over_if_pending_breakpoint(tid)) {
+                ptrace(PTRACE_CONT, tid, 0, 0);
+
+                int drain_status;
+                pid_t drained;
+
+                do {
+                    drained = waitpid(tid, &drain_status, __WALL);
+                } while (drained == -1 && errno == EINTR);
+
+                if (drained == tid &&
+                    (WIFEXITED(drain_status) || WIFSIGNALED(drain_status)))
+                    remove_thread(tid);
+                /* Otherwise the thread is stopped again (whether the
+                 * drained event was the queued SIGSTOP or something
+                 * else) - leave it as-is; best effort. */
+            }
+        }
+    }
+}
+
 void continue_execution()
 {
     if (!dbg.running) {
@@ -1113,43 +1413,97 @@ void continue_execution()
         return;
     }
 
-    for (;;) {
-        ptrace(
-            PTRACE_CONT,
-            dbg.pid,
-            0,
-            0
-        );
+    for (int i = 0; i < thread_count; i++) {
+        ptrace(PTRACE_CONT, threads[i].tid, 0, 0);
+        threads[i].running = 1;
+    }
 
+    for (;;) {
         int status;
-        pid_t ret;
+        pid_t tid;
 
         do {
-            ret = waitpid(dbg.pid, &status, 0);
-        } while (ret == -1 && errno == EINTR);
+            tid = waitpid(-1, &status, __WALL);
+        } while (tid == -1 && errno == EINTR);
 
-        if (WIFEXITED(status)) {
-            disarm_temp_breakpoint(&next_bp);
-            disarm_temp_breakpoint(&finish_bp);
-            disarm_temp_breakpoint(&step_over_bp);
-            heap_on_process_exit();
-            heap_disarm_hooks();
-            wp_count = 0; /* debug registers are per-process; the dead
-                           * tracee's slots no longer exist */
-            printf("[+] process exited\n");
-            dbg.running = 0;
+        if (tid == -1) {
+            perror("waitpid");
             return;
         }
 
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (tid == dbg.pid) {
+                /* Main thread gone: treat as the whole process exiting,
+                 * regardless of whether other threads are still around. */
+                disarm_temp_breakpoint(&next_bp);
+                disarm_temp_breakpoint(&finish_bp);
+                disarm_temp_breakpoint(&step_over_bp);
+                heap_on_process_exit();
+                heap_disarm_hooks();
+                wp_count = 0; /* debug registers are per-process; the dead
+                               * tracee's slots no longer exist */
+                thread_count = 0;
+                printf("[+] process exited\n");
+                dbg.running = 0;
+                return;
+            }
+
+            /* A secondary thread exited; keep waiting for the rest. */
+            remove_thread(tid);
+            continue;
+        }
+
         if (!WIFSTOPPED(status))
-            return;
+            continue;
 
         int sig = WSTOPSIG(status);
+
+        if (sig == SIGTRAP &&
+            ((status >> 16) & 0xffff) == PTRACE_EVENT_CLONE) {
+            /* New thread creation: just register the tid here. Do NOT
+             * resume it yet - its own initial ptrace-stop (delivered as
+             * SIGSTOP, handled below) may not have been reaped yet, and
+             * the two notifications can arrive in either order; the
+             * SIGSTOP handler is the single place that actually CONTs a
+             * freshly-registered thread once its stop is confirmed. */
+            unsigned long new_tid_word = 0;
+
+            if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &new_tid_word) == 0)
+                add_thread((pid_t)new_tid_word);
+
+            ptrace(PTRACE_CONT, tid, 0, 0);
+            continue;
+        }
+
+        if (sig == SIGSTOP) {
+            /* SIGSTOP is never something the debuggee legitimately wants
+             * reported: it is either our own sync_stop_other_threads
+             * mechanism, or the implicit initial stop of a newly cloned
+             * thread. Track the thread if new, and resume it (seeding
+             * its debug registers from any watchpoints already armed)
+             * unless it is one we deliberately just stopped and are
+             * still collecting via sync_stop_other_threads. */
+            add_thread(tid);
+
+            int idx = find_thread_index(tid);
+
+            if (idx >= 0 && !threads[idx].running) {
+                propagate_watchpoints_to_thread(tid);
+                ptrace(PTRACE_CONT, tid, 0, 0);
+                threads[idx].running = 1;
+            }
+
+            continue;
+        }
 
         if (sig != SIGTRAP) {
             struct user_regs_struct regs;
 
-            ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+            ptrace(PTRACE_GETREGS, tid, 0, &regs);
+
+            add_thread(tid);
+            dbg.current_tid = tid;
+            sync_stop_other_threads(tid);
 
             disarm_temp_breakpoint(&next_bp);
             disarm_temp_breakpoint(&finish_bp);
@@ -1165,41 +1519,50 @@ void continue_execution()
 
         struct user_regs_struct regs;
 
-        ptrace(
-            PTRACE_GETREGS,
-            dbg.pid,
-            0,
-            &regs
-        );
+        ptrace(PTRACE_GETREGS, tid, 0, &regs);
 
-        int wp_status = check_watchpoints(&regs);
+        int wp_status = check_watchpoints(tid, &regs);
 
-        if (wp_status == 1)
+        if (wp_status == 1) {
+            add_thread(tid);
+            dbg.current_tid = tid;
+            sync_stop_other_threads(tid);
             return;
-        if (wp_status == 2)
-            continue;
+        }
 
-        if (heap_handle_finish_trap(&regs))
+        if (wp_status == 2) {
+            ptrace(PTRACE_CONT, tid, 0, 0);
             continue;
+        }
 
-        if (heap_handle_trap(&regs))
+        if (heap_handle_finish_trap(&regs)) {
+            ptrace(PTRACE_CONT, tid, 0, 0);
             continue;
+        }
 
-        if (step_over_bp.active &&
+        if (heap_handle_trap(&regs)) {
+            ptrace(PTRACE_CONT, tid, 0, 0);
+            continue;
+        }
+
+        if (tid == dbg.current_tid && step_over_bp.active &&
             regs.rip - 1 == step_over_bp.addr) {
             handle_temp_stop(&step_over_bp);
+            sync_stop_other_threads(tid);
             return;
         }
 
-        if (next_bp.active &&
+        if (tid == dbg.current_tid && next_bp.active &&
             regs.rip - 1 == next_bp.addr) {
             handle_next_hit();
+            sync_stop_other_threads(tid);
             return;
         }
 
-        if (finish_bp.active &&
+        if (tid == dbg.current_tid && finish_bp.active &&
             regs.rip - 1 == finish_bp.addr) {
             handle_finish_hit();
+            sync_stop_other_threads(tid);
             return;
         }
 
@@ -1209,6 +1572,11 @@ void continue_execution()
             );
 
         if (bp) {
+            add_thread(tid); /* defensive: in case its clone notification
+                              * hasn't been processed yet */
+            dbg.current_tid = tid;
+            sync_stop_other_threads(tid);
+
             disarm_temp_breakpoint(&next_bp);
             disarm_temp_breakpoint(&finish_bp);
             disarm_temp_breakpoint(&step_over_bp);
@@ -1219,12 +1587,22 @@ void continue_execution()
             );
             show_stop_location(bp->addr);
 
-            if (step_over_breakpoint(bp) != 0)
+            if (step_over_breakpoint(tid, bp) != 0)
                 printf("[-] failed to re-enable breakpoint\n");
 
             return;
         }
 
+        /* Unrecognized SIGTRAP on a thread we're not actively
+         * stepping/finishing (e.g. a stray singlestep trap on another
+         * thread) - resume it silently rather than stalling `c`. */
+        if (tid != dbg.current_tid) {
+            ptrace(PTRACE_CONT, tid, 0, 0);
+            continue;
+        }
+
+        dbg.current_tid = tid;
+        sync_stop_other_threads(tid);
         printf(
             "[+] stopped signal=%d\n",
             sig

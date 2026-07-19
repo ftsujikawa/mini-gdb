@@ -5,9 +5,11 @@ char debuggee_path[512];
 char debuggee_realpath[512];
 breakpoint_t breakpoints[MAX_BREAKPOINTS];
 watchpoint_t watchpoints[MAX_WATCHPOINTS];
+thread_t threads[MAX_THREADS];
 
 int bp_count = 0;
 int wp_count = 0;
+int thread_count = 0;
 finish_bp_t finish_bp = {0};
 finish_bp_t next_bp = {0};
 symbol_t symbols[MAX_SYMBOLS];

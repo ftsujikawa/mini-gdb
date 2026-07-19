@@ -77,7 +77,7 @@ static int read_var_addr(const char *name,
     var_entry_t *v = lookup_var(name, rip);
     if (v) {
         struct user_regs_struct regs;
-        ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs);
+        ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
 
         if (v->loc == VAR_FBREG)
             *addr_out = regs.rbp + 16 + v->fbreg;
@@ -332,7 +332,7 @@ static int eval_primary_reg(const char *name, c_expr_t *out)
         return -1;
     }
     struct user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, dbg.pid, 0, &regs) == -1) {
+    if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == -1) {
         perror("ptrace getregs");
         return -1;
     }

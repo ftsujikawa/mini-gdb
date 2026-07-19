@@ -22,7 +22,8 @@
 #include "heap.h"
 
 typedef struct {
-    pid_t pid;
+    pid_t pid;         /* thread group id (tgid); the main/original thread */
+    pid_t current_tid; /* tid currently selected for regs/step/bt/print */
     int running;
     int is_pie;
     unsigned long load_base;
@@ -31,6 +32,22 @@ typedef struct {
 extern debugger_t dbg;
 extern char debuggee_path[512];
 extern char debuggee_realpath[512];
+
+/* Threads discovered via PTRACE_O_TRACECLONE. All threads of a process
+ * share one address space, so breakpoints/memory access work the same
+ * regardless of which tid is used; only register/control operations
+ * (GETREGS, SINGLESTEP, debug registers, ...) are genuinely per-thread
+ * and must target dbg.current_tid rather than dbg.pid. */
+#define MAX_THREADS 64
+
+typedef struct {
+    pid_t tid;
+    int active;
+    int running; /* 1 = resumed (PTRACE_CONT'd), 0 = stopped */
+} thread_t;
+
+extern thread_t threads[MAX_THREADS];
+extern int thread_count;
 
 #define MAX_BREAKPOINTS 32
 
@@ -218,6 +235,7 @@ const char *file_basename(const char *path);
 int file_matches(const char *entry_file, const char *query);
 
 long read_memory(unsigned long addr);
+long read_memory_tid(pid_t tid, unsigned long addr);
 int peek_word(unsigned long addr, unsigned long *value);
 int poke_word(unsigned long addr, unsigned long value);
 void examine_memory(unsigned long addr);
@@ -292,10 +310,15 @@ breakpoint_t *find_breakpoint_by_rip(unsigned long rip);
 void watch_command(const char *expr);
 void show_watchpoints(void);
 int delete_watchpoint(int num);
+
+void show_threads(void);
+int switch_thread(int num);
 int restore_breakpoint(breakpoint_t *bp);
 int enable_breakpoint(breakpoint_t *bp);
-void rewind_rip(unsigned long addr);
-int step_over_breakpoint(breakpoint_t *bp);
+int restore_breakpoint_tid(pid_t tid, breakpoint_t *bp);
+int enable_breakpoint_tid(pid_t tid, breakpoint_t *bp);
+void rewind_rip(pid_t tid, unsigned long addr);
+int step_over_breakpoint(pid_t tid, breakpoint_t *bp);
 void handle_finish_hit(void);
 void handle_next_hit(void);
 int get_return_address(unsigned long *ret_addr);

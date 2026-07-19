@@ -16,7 +16,7 @@ endif
 
 OBJS=$(SRCS:.c=.o)
 
-all: tdb target leak_target
+all: tdb target leak_target thread_target
 
 tdb: $(OBJS)
 	$(CC) $(CFLAGS) $(OBJS) -o tdb
@@ -27,8 +27,11 @@ target: target.c
 leak_target: leak_target.c
 	$(CC) -g leak_target.c -o leak_target
 
+thread_target: thread_target.c
+	$(CC) -g -pthread thread_target.c -o thread_target
+
 clean:
-	rm -f tdb target leak_target *.o \
+	rm -f tdb target leak_target thread_target *.o \
 		cmd_parser.c cmd_parser.h cmd_lexer.c \
 		expr_parser.c expr_parser.h expr_lexer.c
 

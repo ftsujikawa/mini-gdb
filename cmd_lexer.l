@@ -38,6 +38,8 @@ EOL     (\r?\n)
 "up"                    return T_UP;
 "kill"                  return T_KILL;
 "regs"                  return T_REGS;
+"threads"               return T_THREADS;
+"thread"                { BEGIN(ARG); return T_THREAD; }
 "syms"                  return T_SYMS;
 "tb"                    return T_TB;
 "list"                  { BEGIN(ARG); return T_LIST; }

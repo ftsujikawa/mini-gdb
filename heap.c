@@ -120,7 +120,12 @@ static int step_over_heap_hook(heap_hook_t *hook)
     if (restore_heap_hook(hook) != 0)
         return -1;
 
-    rewind_rip(hook->addr);
+    /* NOTE: heap-trace hook stepping is not thread-aware and always
+     * targets dbg.pid (the main thread). If a non-main thread calls a
+     * hooked allocator function, this will single-step the wrong tid.
+     * Known limitation: heap-trace + multithreaded allocation is not
+     * fully supported, unlike breakpoints/watchpoints/stepping. */
+    rewind_rip(dbg.pid, hook->addr);
 
     if (ptrace(PTRACE_SINGLESTEP, dbg.pid, 0, 0) == -1) {
         perror("ptrace singlestep");
@@ -516,7 +521,7 @@ int heap_handle_finish_trap(struct user_regs_struct *regs)
                (void *)heap_finish_bp.original_data);
     }
 
-    rewind_rip(heap_finish_bp.addr);
+    rewind_rip(dbg.pid, heap_finish_bp.addr);
     heap_finish_bp.active = 0;
     heap_wait = HEAP_IDLE;
 
