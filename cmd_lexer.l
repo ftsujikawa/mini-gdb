@@ -40,6 +40,8 @@ EOL     (\r?\n)
 "regs"                  return T_REGS;
 "threads"               return T_THREADS;
 "thread"                { BEGIN(ARG); return T_THREAD; }
+"unlock"                return T_UNLOCK;
+"lock"                  { BEGIN(ARG); return T_LOCK; }
 "syms"                  return T_SYMS;
 "tb"                    return T_TB;
 "list"                  { BEGIN(ARG); return T_LIST; }

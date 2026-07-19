@@ -129,6 +129,11 @@ int cmd_parse_line(const char *line, cmd_t *out,
     } else if (!strcmp(cmd, "thread")) {
         out->kind = CMD_THREAD;
         out->arg = dup_str(tmp);
+    } else if (!strcmp(cmd, "lock")) {
+        out->kind = CMD_LOCK;
+        out->arg = dup_str(tmp);
+    } else if (!strcmp(cmd, "unlock")) {
+        out->kind = CMD_UNLOCK;
     } else if (!strcmp(cmd, "regs")) {
         out->kind = CMD_REGS;
     } else if (!strcmp(cmd, "syms")) {

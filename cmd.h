@@ -15,6 +15,8 @@ typedef enum {
     CMD_WATCH,
     CMD_THREADS,
     CMD_THREAD,
+    CMD_LOCK,
+    CMD_UNLOCK,
     CMD_REGS,
     CMD_SYMS,
     CMD_TB,

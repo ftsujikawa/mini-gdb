@@ -30,7 +30,7 @@ void cmdyyerror(const char *s);
 
 %token T_RUN T_C T_S T_SI T_N T_UP T_KILL T_REGS T_SYMS T_TB
 %token T_L T_LIST T_DIS T_B T_BREAK T_DEL T_DELETE T_SHOW T_DBG T_LINES T_X
-%token T_P T_PRINT T_SET T_WATCH T_THREADS T_THREAD
+%token T_P T_PRINT T_SET T_WATCH T_THREADS T_THREAD T_LOCK T_UNLOCK
 %token T_HELP T_Q
 
 %%
@@ -65,6 +65,8 @@ line
         { set_cmd(CMD_REGS, NULL); }
     | T_THREADS T_EOL
         { set_cmd(CMD_THREADS, NULL); }
+    | T_UNLOCK T_EOL
+        { set_cmd(CMD_UNLOCK, NULL); }
     | T_SYMS T_EOL
         { set_cmd(CMD_SYMS, NULL); }
     | T_TB T_EOL
@@ -117,6 +119,9 @@ line
 
     | T_THREAD T_REST opt_eol
         { set_cmd(CMD_THREAD, $2); }
+
+    | T_LOCK T_REST opt_eol
+        { set_cmd(CMD_LOCK, $2); }
 
     | T_WORD T_EOL
         {

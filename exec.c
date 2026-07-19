@@ -6,6 +6,13 @@
 #define PTRACE_EVENT_EXEC 4
 #define PTRACE_EVENT_CLONE 3
 
+/* Scheduler lock: while set to a nonzero tid, `continue_execution`'s
+ * resume step only resumes that tid (plus dbg.current_tid, in case the
+ * user switched focus elsewhere - this keeps single-thread stepping
+ * that internally calls continue_execution, such as `next` skipping
+ * over a call, from deadlocking). Every other thread stays stopped. */
+static pid_t locked_tid = 0;
+
 static int wait_for_exec(pid_t pid)
 {
     ptrace(PTRACE_SETOPTIONS, pid, 0,
@@ -43,6 +50,7 @@ void run_target(char *program)
     dbg.is_pie = 0;
     dbg.load_base = 0;
     wp_count = 0; /* hardware watchpoints don't survive across processes */
+    locked_tid = 0;
 
     pid_t pid = fork();
 
@@ -147,6 +155,24 @@ static void remove_thread(pid_t tid)
 
     if (dbg.current_tid == tid && thread_count > 0)
         dbg.current_tid = threads[0].tid;
+
+    if (locked_tid == tid) {
+        /* The locked thread just exited. Clear the lock and, since the
+         * resume loop at the top of continue_execution() only resumed
+         * the locked tid (leaving everyone else stopped with running=0),
+         * wake those other threads up now - otherwise they'd stay
+         * parked forever and this wait loop would hang waiting for
+         * events that can never arrive. */
+        printf("[+] locked tid=%d exited; scheduler lock cleared\n", tid);
+        locked_tid = 0;
+
+        for (int i = 0; i < thread_count; i++) {
+            if (!threads[i].running) {
+                ptrace(PTRACE_CONT, threads[i].tid, 0, 0);
+                threads[i].running = 1;
+            }
+        }
+    }
 }
 
 void show_threads(void)
@@ -156,13 +182,39 @@ void show_threads(void)
         return;
     }
 
-    printf("   Id  Tid\n");
+    printf("   Id  Tid      Location\n");
 
     for (int i = 0; i < thread_count; i++) {
-        printf("%s  %-3d %d\n",
+        printf("%s  %-3d %-8d ",
                threads[i].tid == dbg.current_tid ? "*" : " ",
                i + 1,
                threads[i].tid);
+
+        struct user_regs_struct regs;
+
+        if (ptrace(PTRACE_GETREGS, threads[i].tid, 0, &regs) != 0) {
+            printf("(unknown)\n");
+            continue;
+        }
+
+        const symbol_t *sym = lookup_function_symbol(regs.rip);
+        unsigned long debug_addr = to_debug_addr(regs.rip);
+        const char *file;
+        int line;
+
+        printf("0x%016llx", regs.rip);
+
+        if (sym) {
+            printf(" in %s", sym->name);
+
+            if (debug_addr >= sym->addr)
+                printf("+0x%lx", debug_addr - sym->addr);
+        }
+
+        if (lookup_line(regs.rip, &file, &line) == 0)
+            printf(" at %s:%d", file, line);
+
+        printf("\n");
     }
 }
 
@@ -182,6 +234,41 @@ int switch_thread(int num)
         show_stop_location(regs.rip);
 
     return 0;
+}
+
+void lock_thread(int tid)
+{
+    if (!dbg.running) {
+        printf("no process\n");
+        return;
+    }
+
+    if (find_thread_index((pid_t)tid) < 0) {
+        printf("no such tid: %d (use 'threads' to list them)\n", tid);
+        return;
+    }
+
+    locked_tid = (pid_t)tid;
+    dbg.current_tid = locked_tid;
+
+    printf("[+] locked to tid=%d (other threads stay stopped on `c`)\n",
+           locked_tid);
+
+    struct user_regs_struct regs;
+
+    if (ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs) == 0)
+        show_stop_location(regs.rip);
+}
+
+void unlock_threads(void)
+{
+    if (locked_tid == 0) {
+        printf("not locked\n");
+        return;
+    }
+
+    printf("[+] unlocked tid=%d (all threads resume on `c`)\n", locked_tid);
+    locked_tid = 0;
 }
 
 void single_step()
@@ -1108,6 +1195,7 @@ void kill_process(void)
 
     wp_count = 0;
     thread_count = 0;
+    locked_tid = 0;
     dbg.running = 0;
     printf("[+] process killed (pid=%d)\n", dbg.pid);
 }
@@ -1414,6 +1502,15 @@ void continue_execution()
     }
 
     for (int i = 0; i < thread_count; i++) {
+        /* Under a scheduler lock, only the locked tid (and whichever
+         * tid is currently selected, so an internal step-over-a-call
+         * sub-continue from next_line can't deadlock) get resumed;
+         * every other thread is left stopped. */
+        if (locked_tid != 0 &&
+            threads[i].tid != locked_tid &&
+            threads[i].tid != dbg.current_tid)
+            continue;
+
         ptrace(PTRACE_CONT, threads[i].tid, 0, 0);
         threads[i].running = 1;
     }
@@ -1443,6 +1540,7 @@ void continue_execution()
                 wp_count = 0; /* debug registers are per-process; the dead
                                * tracee's slots no longer exist */
                 thread_count = 0;
+                locked_tid = 0;
                 printf("[+] process exited\n");
                 dbg.running = 0;
                 return;
@@ -1489,8 +1587,16 @@ void continue_execution()
 
             if (idx >= 0 && !threads[idx].running) {
                 propagate_watchpoints_to_thread(tid);
-                ptrace(PTRACE_CONT, tid, 0, 0);
-                threads[idx].running = 1;
+
+                /* Respect an active scheduler lock: a thread newly
+                 * spawned while locked to a different tid must not
+                 * start running either. It stays registered but
+                 * stopped until `unlock` (or a lock on this tid). */
+                if (locked_tid == 0 || tid == locked_tid ||
+                    tid == dbg.current_tid) {
+                    ptrace(PTRACE_CONT, tid, 0, 0);
+                    threads[idx].running = 1;
+                }
             }
 
             continue;

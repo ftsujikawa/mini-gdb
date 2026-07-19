@@ -532,6 +532,8 @@ void show_help(void)
     printf("  kill                       terminate the debuggee (keeps tdb running)\n");
     printf("  threads                    list threads in the debuggee\n");
     printf("  thread <num>               switch regs/step/bt/print to that thread\n");
+    printf("  lock <tid>                 run only tid on `c`; other threads stay stopped\n");
+    printf("  unlock                     let `c` resume all threads again\n");
     printf("  b|break <loc>              set breakpoint (addr, symbol, file:line)\n");
     printf("  watch [/r] [/N] <expr>     hw watchpoint; /r=read+write, /N=size(1,2,4,8)\n");
     printf("  del|delete <num>           delete breakpoint by number\n");
@@ -620,6 +622,23 @@ void handle(char *line)
         switch_thread((int)num);
         break;
     }
+    case CMD_LOCK: {
+        char *arg = cmd.arg ? cmd.arg : "";
+        char *end;
+        long tid = strtol(arg, &end, 10);
+
+        if (*end != '\0' || end == arg || tid <= 0) {
+            printf("usage: lock <tid>\n");
+            printf("       (use 'threads' to list tids)\n");
+            break;
+        }
+
+        lock_thread((int)tid);
+        break;
+    }
+    case CMD_UNLOCK:
+        unlock_threads();
+        break;
     case CMD_REGS:
         show_regs();
         break;

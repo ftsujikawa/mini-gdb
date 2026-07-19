@@ -313,6 +313,8 @@ int delete_watchpoint(int num);
 
 void show_threads(void);
 int switch_thread(int num);
+void lock_thread(int tid);
+void unlock_threads(void);
 int restore_breakpoint(breakpoint_t *bp);
 int enable_breakpoint(breakpoint_t *bp);
 int restore_breakpoint_tid(pid_t tid, breakpoint_t *bp);
