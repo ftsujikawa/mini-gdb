@@ -15,7 +15,7 @@ int poke_word(unsigned long addr, unsigned long value)
 {
     errno = 0;
 
-    if (ptrace(PTRACE_POKEDATA, dbg.pid, (void *)addr,
+    if (ptrace(PTRACE_POKEDATA, dbg.current_tid, (void *)addr,
                (void *)value) == -1) {
         perror("ptrace poke");
         return -1;
@@ -23,11 +23,13 @@ int poke_word(unsigned long addr, unsigned long value)
 
     return 0;
 }
-/* All threads of a process share one address space, so any currently
- * ptrace-stopped tid works equally well for a PEEKDATA; callers that
- * already know a specific stopped tid (e.g. continue_execution's event
- * dispatch, where dbg.pid itself may still be running) should use this
- * instead of read_memory(), which always targets dbg.pid. */
+/* All threads of the SAME process share one address space, so any of
+ * its currently ptrace-stopped tids works equally well for a PEEKDATA;
+ * callers that already know a specific stopped tid belonging to a
+ * *different* process than dbg.current_tid (e.g. continue_execution's
+ * event dispatch, where the selected thread may still be running) must
+ * use this instead of read_memory(), which always targets whichever
+ * process dbg.current_tid currently belongs to. */
 long read_memory_tid(pid_t tid, unsigned long addr)
 {
     errno = 0;
@@ -50,14 +52,14 @@ long read_memory_tid(pid_t tid, unsigned long addr)
 
 long read_memory(unsigned long addr)
 {
-    return read_memory_tid(dbg.pid, addr);
+    return read_memory_tid(dbg.current_tid, addr);
 }
 
 int peek_word(unsigned long addr, unsigned long *value)
 {
     errno = 0;
     long data = ptrace(PTRACE_PEEKDATA,
-                       dbg.pid,
+                       dbg.current_tid,
                        (void *)addr,
                        0);
 

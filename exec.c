@@ -3,20 +3,32 @@
 
 #include <sys/syscall.h>
 
-#define PTRACE_EVENT_EXEC 4
+#define PTRACE_EVENT_FORK 1
+#define PTRACE_EVENT_VFORK 2
 #define PTRACE_EVENT_CLONE 3
+#define PTRACE_EVENT_EXEC 4
 
 /* Scheduler lock: while set to a nonzero tid, `continue_execution`'s
- * resume step only resumes that tid (plus dbg.current_tid, in case the
- * user switched focus elsewhere - this keeps single-thread stepping
- * that internally calls continue_execution, such as `next` skipping
- * over a call, from deadlocking). Every other thread stays stopped. */
+ * resume step only resumes that exact tid. Every other tracked thread
+ * (in this or any other tracked process) stays stopped; si/s/n/up
+ * refuse to run a non-locked tid outright (see single_step() etc.),
+ * so this invariant never needs an exception for whatever tid happens
+ * to be currently selected. */
 static pid_t locked_tid = 0;
 
 static int wait_for_exec(pid_t pid)
 {
+    /* TRACEFORK/TRACEVFORK: the debuggee calling fork()/vfork() is
+     * assumed to keep running the same executable in the child (no
+     * execve() tracking), so its child process is treated the same
+     * way TRACECLONE already treats a new thread - discovered and
+     * added to threads[], just as its own process (pid == tid) rather
+     * than joining an existing one. These options are inherited by
+     * further descendants automatically (see ptrace(2)), so this only
+     * needs to be set once, here. */
     ptrace(PTRACE_SETOPTIONS, pid, 0,
-           PTRACE_O_TRACEEXEC | PTRACE_O_TRACECLONE);
+           PTRACE_O_TRACEEXEC | PTRACE_O_TRACECLONE |
+           PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK);
 
     for (int i = 0; i < 5; i++) {
         if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
@@ -101,6 +113,7 @@ void run_target(char *program)
     dbg.current_tid = pid;
     thread_count = 1;
     threads[0].tid = pid;
+    threads[0].pid = pid;
     threads[0].active = 1;
     threads[0].running = 0;
 
@@ -121,10 +134,33 @@ static int find_thread_index(pid_t tid)
     return -1;
 }
 
-static int add_thread(pid_t tid)
+/* Which process (tgid) a tracked tid belongs to, or 0 if `tid` isn't
+ * currently tracked. Used by ui.c's show_stop_location() to report the
+ * actual process a stop pertains to, rather than always dbg.pid. */
+pid_t process_of_tid(pid_t tid)
 {
-    if (find_thread_index(tid) >= 0)
+    int idx = find_thread_index(tid);
+
+    return idx >= 0 ? threads[idx].pid : 0;
+}
+
+/* `pid` is the thread group (process) `tid` belongs to; pass 0 if not
+ * yet known (e.g. a SIGSTOP observed before the CLONE/FORK/VFORK event
+ * that would have supplied it) - it gets filled in later, whenever
+ * that authoritative event is processed, by the reconciliation below.
+ * Until reconciled, a pid-dependent operation (tgkill, SIGKILL, ...) on
+ * this tid is simply not attempted; this is the same kind of narrow,
+ * self-healing race window that thread registration already tolerates
+ * elsewhere in this file. */
+static int add_thread(pid_t tid, pid_t pid)
+{
+    int idx = find_thread_index(tid);
+
+    if (idx >= 0) {
+        if (pid != 0 && threads[idx].pid == 0)
+            threads[idx].pid = pid;
         return 0;
+    }
 
     if (thread_count >= MAX_THREADS) {
         printf("[-] too many threads (max %d), not tracking tid=%d\n",
@@ -133,6 +169,7 @@ static int add_thread(pid_t tid)
     }
 
     threads[thread_count].tid = tid;
+    threads[thread_count].pid = pid;
     threads[thread_count].active = 1;
     threads[thread_count].running = 0;
     thread_count++;
@@ -182,13 +219,14 @@ void show_threads(void)
         return;
     }
 
-    printf("   Id  Tid      Location\n");
+    printf("   Id  Pid      Tid      Location\n");
 
     for (int i = 0; i < thread_count; i++) {
-        printf("%s%s %-3d %-8d ",
+        printf("%s%s %-3d %-8d %-8d ",
                threads[i].tid == dbg.current_tid ? "*" : " ",
                locked_tid != 0 && threads[i].tid == locked_tid ? "L" : " ",
                i + 1,
+               threads[i].pid,
                threads[i].tid);
 
         struct user_regs_struct regs;
@@ -444,22 +482,16 @@ void set_breakpoint(unsigned long addr)
     bp->original_data = data;
     bp->enabled = 1;
 
-    /*
-       replace first byte with INT3
-       INT3 = 0xCC
-    */
+    /* INT3 lives in per-process memory, so it must be poked into every
+     * tracked process, not just the original one: fork children only
+     * inherit (via copy-on-write) INT3 bytes that already existed at
+     * fork time, not ones added afterward. */
+    for (int i = 0; i < thread_count; i++) {
+        if (threads[i].tid != threads[i].pid)
+            continue;
 
-    long patched =
-        (data & ~0xff) | 0xcc;
-
-    if (ptrace(
-            PTRACE_POKEDATA,
-            dbg.pid,
-            (void*)addr,
-            (void*)patched) == -1) {
-
-        perror("ptrace poke");
-        return;
+        if (enable_breakpoint_tid(threads[i].pid, bp) == -1)
+            return;
     }
 
     bp_count++;
@@ -531,8 +563,15 @@ int delete_breakpoint(int num)
     breakpoint_t *bp = &breakpoints[num - 1];
 
     if (bp->enabled) {
-        if (restore_breakpoint(bp) == -1)
-            return -1;
+        /* INT3 lives in per-process memory, so restore it in every
+         * tracked process, not just the original one (fork children
+         * each have their own copy). */
+        for (int i = 0; i < thread_count; i++) {
+            if (threads[i].tid != threads[i].pid)
+                continue;
+
+            restore_breakpoint_tid(threads[i].pid, bp);
+        }
     }
 
     /* Shift remaining breakpoints down */
@@ -881,6 +920,11 @@ static int check_watchpoints(pid_t tid, struct user_regs_struct *regs)
     poke_debugreg(tid, 6, 0);
 
     if (changed) {
+        /* Must happen before show_stop_location(), which reports
+         * dbg.current_tid - otherwise a watchpoint hit on some other
+         * (non-current) tid/process would misreport whichever tid was
+         * previously selected instead of the one that actually hit. */
+        dbg.current_tid = tid;
         show_stop_location(regs->rip);
         return 1;
     }
@@ -903,11 +947,6 @@ int restore_breakpoint_tid(pid_t tid, breakpoint_t *bp)
     return 0;
 }
 
-int restore_breakpoint(breakpoint_t *bp)
-{
-    return restore_breakpoint_tid(dbg.pid, bp);
-}
-
 int enable_breakpoint_tid(pid_t tid, breakpoint_t *bp)
 {
     long patched =
@@ -924,11 +963,6 @@ int enable_breakpoint_tid(pid_t tid, breakpoint_t *bp)
     }
 
     return 0;
-}
-
-int enable_breakpoint(breakpoint_t *bp)
-{
-    return enable_breakpoint_tid(dbg.pid, bp);
 }
 
 void rewind_rip(pid_t tid, unsigned long addr)
@@ -1039,6 +1073,12 @@ static int arm_temp_breakpoint(finish_bp_t *tp, unsigned long addr)
 
     tp->active = 1;
     tp->addr = addr;
+    /* Recorded up front (rather than relying on dbg.current_tid later)
+     * so disarm/handle still target the right thread/process even if
+     * dbg.current_tid gets reassigned in between - e.g. some other,
+     * unrelated tid hitting its own breakpoint while this one is
+     * pending. */
+    tp->tid = dbg.current_tid;
 
     if (existing) {
         tp->uses_existing = 1;
@@ -1059,7 +1099,7 @@ static int arm_temp_breakpoint(finish_bp_t *tp, unsigned long addr)
     long patched = (data & ~0xff) | 0xcc;
 
     if (ptrace(PTRACE_POKEDATA,
-               dbg.pid,
+               tp->tid,
                (void *)addr,
                (void *)patched) == -1) {
         perror("ptrace poke");
@@ -1078,7 +1118,7 @@ static void disarm_temp_breakpoint(finish_bp_t *tp)
     if (!tp->uses_existing) {
         ptrace(
             PTRACE_POKEDATA,
-            dbg.pid,
+            tp->tid,
             (void *)tp->addr,
             (void *)tp->original_data
         );
@@ -1090,13 +1130,9 @@ static void disarm_temp_breakpoint(finish_bp_t *tp)
 static unsigned long handle_temp_stop(finish_bp_t *tp)
 {
     if (!tp->uses_existing) {
-        /* dbg.current_tid, not dbg.pid: this restore always concerns
-         * whichever thread is being stepped/finished, which may not be
-         * the main thread (and may be the only one currently stopped
-         * at this point, before sync_stop_other_threads runs). */
         ptrace(
             PTRACE_POKEDATA,
-            dbg.current_tid,
+            tp->tid,
             (void *)tp->addr,
             (void *)tp->original_data
         );
@@ -1104,7 +1140,7 @@ static unsigned long handle_temp_stop(finish_bp_t *tp)
 
     unsigned long addr = tp->addr;
 
-    rewind_rip(dbg.current_tid, addr);
+    rewind_rip(tp->tid, addr);
     tp->active = 0;
 
     return addr;
@@ -1190,9 +1226,14 @@ void kill_process(void)
     disarm_temp_breakpoint(&step_over_bp);
     heap_disarm_hooks();
 
-    kill(dbg.pid, SIGKILL);
+    /* SIGKILL targets one thread group (tgid) at a time; with fork()
+     * children tracked, that may be more than just dbg.pid. */
+    for (int i = 0; i < thread_count; i++) {
+        if (threads[i].tid == threads[i].pid)
+            kill(threads[i].pid, SIGKILL);
+    }
 
-    /* SIGKILL brings down the whole thread group, but each thread still
+    /* SIGKILL brings down each thread group, but every thread still
      * produces its own wait event; reap all of them so none are left as
      * zombies. */
     int remaining = thread_count;
@@ -1427,6 +1468,51 @@ static int step_over_if_pending_breakpoint(pid_t tid)
     return 1;
 }
 
+/* Recognizes a PTRACE_EVENT_CLONE/FORK/VFORK notification riding on a
+ * SIGTRAP stop for `tid`, registers the new tid/process it reports
+ * (via PTRACE_GETEVENTMSG), and resumes `tid` past it. Returns 1 if
+ * `status` was such a notification (fully handled here); 0 otherwise,
+ * meaning the caller still needs to figure out what this stop was.
+ * Shared between continue_execution()'s main dispatch and
+ * sync_stop_other_threads(): a thread being forced to stop for
+ * synchronization can just as easily be the one that happens to
+ * create a new thread/process at that exact moment, and discarding
+ * that notification (as the generic "some other stop reason, not a
+ * breakpoint" fallback would) permanently loses the new tid's pid. */
+static int handle_new_thread_event(pid_t tid, int status)
+{
+    if (WSTOPSIG(status) != SIGTRAP)
+        return 0;
+
+    int event = (status >> 16) & 0xffff;
+
+    if (event == PTRACE_EVENT_CLONE) {
+        unsigned long new_tid_word = 0;
+
+        if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &new_tid_word) == 0) {
+            int parent_idx = find_thread_index(tid);
+
+            add_thread((pid_t)new_tid_word,
+                       parent_idx >= 0 ? threads[parent_idx].pid : 0);
+        }
+
+        ptrace(PTRACE_CONT, tid, 0, 0);
+        return 1;
+    }
+
+    if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK) {
+        unsigned long new_pid_word = 0;
+
+        if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &new_pid_word) == 0)
+            add_thread((pid_t)new_pid_word, (pid_t)new_pid_word);
+
+        ptrace(PTRACE_CONT, tid, 0, 0);
+        return 1;
+    }
+
+    return 0;
+}
+
 /* All-stop synchronization: once one thread has a genuine stop event to
  * report, every other still-running thread is forced to stop too (via a
  * directed SIGSTOP) so the whole process is halted at the prompt, matching
@@ -1443,7 +1529,9 @@ static void sync_stop_other_threads(pid_t stopped_tid)
         }
 
         if (threads[i].running) {
-            syscall(SYS_tgkill, dbg.pid, threads[i].tid, SIGSTOP);
+            /* tgkill needs the tid's OWN thread group, which may be a
+             * fork()ed child's pid rather than dbg.pid. */
+            syscall(SYS_tgkill, threads[i].pid, threads[i].tid, SIGSTOP);
             pending++;
         }
     }
@@ -1464,8 +1552,7 @@ static void sync_stop_other_threads(pid_t stopped_tid)
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
             if (idx >= 0 && threads[idx].running)
                 pending--;
-            if (tid != dbg.pid)
-                remove_thread(tid);
+            remove_thread(tid);
             continue;
         }
 
@@ -1475,12 +1562,14 @@ static void sync_stop_other_threads(pid_t stopped_tid)
         int sig = WSTOPSIG(status);
 
         if (idx < 0) {
-            /* Thread not yet registered - its parent's clone
+            /* Thread not yet registered - its parent's clone/fork
              * notification hasn't reached the main dispatch loop yet.
-             * Register it now and make sure it isn't left parked
-             * mid-breakpoint; it never counted against `pending` since
-             * we never explicitly stopped it. */
-            add_thread(tid);
+             * Register it now (pid unknown for the moment - it will
+             * be filled in once that notification is processed) and
+             * make sure it isn't left parked mid-breakpoint; it never
+             * counted against `pending` since we never explicitly
+             * stopped it. */
+            add_thread(tid, 0);
 
             if (sig != SIGSTOP)
                 step_over_if_pending_breakpoint(tid);
@@ -1495,6 +1584,17 @@ static void sync_stop_other_threads(pid_t stopped_tid)
         pending--;
 
         if (sig != SIGSTOP) {
+            if (handle_new_thread_event(tid, status)) {
+                /* tid just created a new thread/process, not stopped
+                 * for a reportable reason of its own; undo the
+                 * running=0/pending-- above and keep waiting for its
+                 * real subsequent stop (most likely the SIGSTOP sent
+                 * to it above, still queued). */
+                threads[idx].running = 1;
+                pending++;
+                continue;
+            }
+
             /* This thread stopped for its own reason (e.g. it hit the
              * same breakpoint/watchpoint at nearly the same moment as
              * stopped_tid), not because of the SIGSTOP just sent to
@@ -1562,9 +1662,15 @@ void continue_execution()
         }
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            if (tid == dbg.pid) {
-                /* Main thread gone: treat as the whole process exiting,
-                 * regardless of whether other threads are still around. */
+            int idx = find_thread_index(tid);
+            int was_process_root = (idx >= 0 && threads[idx].pid == tid);
+
+            remove_thread(tid);
+
+            if (thread_count == 0) {
+                /* Every tracked process's every thread is now gone
+                 * (not just dbg.pid's - a fork()ed child may outlive
+                 * or outnumber the original process's threads). */
                 disarm_temp_breakpoint(&next_bp);
                 disarm_temp_breakpoint(&finish_bp);
                 disarm_temp_breakpoint(&step_over_bp);
@@ -1572,15 +1678,17 @@ void continue_execution()
                 heap_disarm_hooks();
                 wp_count = 0; /* debug registers are per-process; the dead
                                * tracee's slots no longer exist */
-                thread_count = 0;
                 locked_tid = 0;
                 printf("[+] process exited\n");
                 dbg.running = 0;
                 return;
             }
 
-            /* A secondary thread exited; keep waiting for the rest. */
-            remove_thread(tid);
+            /* This process is gone but at least one other tracked
+             * process/thread remains; keep waiting. */
+            if (was_process_root)
+                printf("[+] process pid=%d exited "
+                       "(other tracked processes remain)\n", tid);
             continue;
         }
 
@@ -1589,32 +1697,34 @@ void continue_execution()
 
         int sig = WSTOPSIG(status);
 
-        if (sig == SIGTRAP &&
-            ((status >> 16) & 0xffff) == PTRACE_EVENT_CLONE) {
-            /* New thread creation: just register the tid here. Do NOT
-             * resume it yet - its own initial ptrace-stop (delivered as
-             * SIGSTOP, handled below) may not have been reaped yet, and
-             * the two notifications can arrive in either order; the
-             * SIGSTOP handler is the single place that actually CONTs a
-             * freshly-registered thread once its stop is confirmed. */
-            unsigned long new_tid_word = 0;
-
-            if (ptrace(PTRACE_GETEVENTMSG, tid, 0, &new_tid_word) == 0)
-                add_thread((pid_t)new_tid_word);
-
-            ptrace(PTRACE_CONT, tid, 0, 0);
+        /* New thread (CLONE) or new process (FORK/VFORK): register it
+         * here and resume the reporting tid past the notification. Do
+         * NOT resume the newly reported tid/pid itself yet - its own
+         * initial ptrace-stop (delivered as SIGSTOP, handled below)
+         * may not have been reaped yet, and the two notifications can
+         * arrive in either order; the SIGSTOP handler is the single
+         * place that actually CONTs a freshly-registered tid once its
+         * stop is confirmed. A forked child's memory is a fork-time
+         * copy of the parent's, so any breakpoint already set is
+         * already physically present (copy-on-write) - only ones set
+         * *after* this need propagating, which set_breakpoint()
+         * handles by walking every tracked process; its debug
+         * registers, unlike INT3 bytes in memory, are NOT inherited
+         * and still need seeding, same as for a cloned thread - both
+         * handled by the SIGSTOP branch below. */
+        if (handle_new_thread_event(tid, status))
             continue;
-        }
 
         if (sig == SIGSTOP) {
             /* SIGSTOP is never something the debuggee legitimately wants
              * reported: it is either our own sync_stop_other_threads
              * mechanism, or the implicit initial stop of a newly cloned
-             * thread. Track the thread if new, and resume it (seeding
-             * its debug registers from any watchpoints already armed)
-             * unless it is one we deliberately just stopped and are
-             * still collecting via sync_stop_other_threads. */
-            add_thread(tid);
+             * thread or forked process. Track the thread if new, and
+             * resume it (seeding its debug registers from any
+             * watchpoints already armed) unless it is one we
+             * deliberately just stopped and are still collecting via
+             * sync_stop_other_threads. */
+            add_thread(tid, 0);
 
             int idx = find_thread_index(tid);
 
@@ -1634,12 +1744,25 @@ void continue_execution()
             continue;
         }
 
+        if (sig == SIGCHLD) {
+            /* A traced process that manages its own children (e.g. a
+             * fork()-based server reaping them via waitpid()) receives
+             * its own SIGCHLD whenever one exits; since we intercept
+             * every signal delivered to a tracee, that would otherwise
+             * stop here and force the user to `c` through one prompt
+             * per child exit. gdb's default is to pass SIGCHLD through
+             * without stopping, so do the same: forward it and keep
+             * going, rather than treating it as a reportable stop. */
+            ptrace(PTRACE_CONT, tid, 0, sig);
+            continue;
+        }
+
         if (sig != SIGTRAP) {
             struct user_regs_struct regs;
 
             ptrace(PTRACE_GETREGS, tid, 0, &regs);
 
-            add_thread(tid);
+            add_thread(tid, 0);
             dbg.current_tid = tid;
             sync_stop_other_threads(tid);
 
@@ -1662,7 +1785,7 @@ void continue_execution()
         int wp_status = check_watchpoints(tid, &regs);
 
         if (wp_status == 1) {
-            add_thread(tid);
+            add_thread(tid, 0);
             dbg.current_tid = tid;
             sync_stop_other_threads(tid);
             return;
@@ -1710,8 +1833,9 @@ void continue_execution()
             );
 
         if (bp) {
-            add_thread(tid); /* defensive: in case its clone notification
-                              * hasn't been processed yet */
+            add_thread(tid, 0); /* defensive: in case its clone/fork
+                                  * notification hasn't been processed
+                                  * yet */
             dbg.current_tid = tid;
             sync_stop_other_threads(tid);
 

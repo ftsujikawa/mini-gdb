@@ -22,7 +22,9 @@
 #include "heap.h"
 
 typedef struct {
-    pid_t pid;         /* thread group id (tgid); the main/original thread */
+    pid_t pid;         /* thread group id (tgid) of the original process
+                         * started by `run` (fork children get their own,
+                         * separate tgid - see thread_t.pid below) */
     pid_t current_tid; /* tid currently selected for regs/step/bt/print */
     int running;
     int is_pie;
@@ -33,15 +35,24 @@ extern debugger_t dbg;
 extern char debuggee_path[512];
 extern char debuggee_realpath[512];
 
-/* Threads discovered via PTRACE_O_TRACECLONE. All threads of a process
- * share one address space, so breakpoints/memory access work the same
- * regardless of which tid is used; only register/control operations
+/* Threads discovered via PTRACE_O_TRACECLONE, plus the root ("main")
+ * thread of every process discovered via PTRACE_O_TRACEFORK/TRACEVFORK
+ * (the original one started by `run`, and any fork()/vfork() children
+ * it or its descendants create - all assumed to still be running the
+ * same executable, since none of this tracks a later execve()). All
+ * threads of the SAME process (matching .pid) share one address space,
+ * so breakpoints/memory access work the same regardless of which of
+ * its tids is used; but a *different* process (different .pid) has its
+ * own separate address space; only register/control operations
  * (GETREGS, SINGLESTEP, debug registers, ...) are genuinely per-thread
- * and must target dbg.current_tid rather than dbg.pid. */
+ * and must target dbg.current_tid rather than any fixed tid. A thread
+ * is its process's root exactly when tid == pid. */
 #define MAX_THREADS 64
 
 typedef struct {
     pid_t tid;
+    pid_t pid; /* thread group id (process) this tid belongs to;
+                * tid == pid marks a process's root/main thread */
     int active;
     int running; /* 1 = resumed (PTRACE_CONT'd), 0 = stopped */
 } thread_t;
@@ -82,6 +93,9 @@ typedef struct {
     int uses_existing;
     unsigned long addr;
     long original_data;
+    pid_t tid; /* thread it was armed for; may belong to any tracked
+                * process, so disarming must target this tid, not
+                * whatever dbg.current_tid happens to be later */
 } finish_bp_t;
 
 extern finish_bp_t finish_bp;
@@ -315,8 +329,7 @@ void show_threads(void);
 int switch_thread(int num);
 void lock_thread(int tid);
 void unlock_threads(void);
-int restore_breakpoint(breakpoint_t *bp);
-int enable_breakpoint(breakpoint_t *bp);
+pid_t process_of_tid(pid_t tid);
 int restore_breakpoint_tid(pid_t tid, breakpoint_t *bp);
 int enable_breakpoint_tid(pid_t tid, breakpoint_t *bp);
 void rewind_rip(pid_t tid, unsigned long addr);

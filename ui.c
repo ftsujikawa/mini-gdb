@@ -225,10 +225,12 @@ void show_stop_location(unsigned long pc)
     const char *file;
     int line;
 
-    /* dbg.pid is the thread group id (main thread); dbg.current_tid is
-     * whichever thread this stop actually pertains to (may differ once
-     * the debuggee has spawned additional threads). */
-    printf("[+] pid=%d tid=%d\n", dbg.pid, dbg.current_tid);
+    /* The actual process (tgid) dbg.current_tid belongs to - not
+     * always dbg.pid, once the debuggee has fork()ed additional
+     * processes of its own. */
+    pid_t pid = process_of_tid(dbg.current_tid);
+
+    printf("[+] pid=%d tid=%d\n", pid != 0 ? pid : dbg.pid, dbg.current_tid);
 
     if (lookup_line(pc, &file, &line) == 0) {
         printf("=> %s:%d\n", file, line);
@@ -796,8 +798,16 @@ void handle(char *line)
 static void sigint_handler(int sig)
 {
     (void)sig;
-    if (dbg.running && dbg.pid > 0)
-        kill(dbg.pid, SIGINT);
+
+    if (!dbg.running)
+        return;
+
+    /* Forward to every tracked process (a fork()ed child is a separate
+     * thread group of its own, not reachable via dbg.pid alone). */
+    for (int i = 0; i < thread_count; i++) {
+        if (threads[i].tid == threads[i].pid)
+            kill(threads[i].pid, SIGINT);
+    }
 }
 
 void repl()
