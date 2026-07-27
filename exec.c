@@ -59,6 +59,15 @@ static int wait_for_exec(pid_t pid)
 
 void run_target(char *program)
 {
+    /* Without this, a `run` issued while a debuggee is already active
+     * would just fork a second, wholly independent one on top of it:
+     * dbg/threads[] gets overwritten to track only the new one, while
+     * the old one is never killed and keeps running in the
+     * background sharing this same terminal - visibly garbling output
+     * from both processes interleaved together. */
+    if (dbg.running)
+        kill_process();
+
     dbg.is_pie = 0;
     dbg.load_base = 0;
     wp_count = 0; /* hardware watchpoints don't survive across processes */
@@ -485,13 +494,15 @@ void set_breakpoint(unsigned long addr)
     /* INT3 lives in per-process memory, so it must be poked into every
      * tracked process, not just the original one: fork children only
      * inherit (via copy-on-write) INT3 bytes that already existed at
-     * fork time, not ones added afterward. */
+     * fork time, not ones added afterward. A given process can fail
+     * here (ESRCH) if it exited a moment ago and hasn't been reaped
+     * yet - skip it rather than aborting registration for every
+     * other, still-alive process over one that's already gone. */
     for (int i = 0; i < thread_count; i++) {
         if (threads[i].tid != threads[i].pid)
             continue;
 
-        if (enable_breakpoint_tid(threads[i].pid, bp) == -1)
-            return;
+        enable_breakpoint_tid(threads[i].pid, bp);
     }
 
     bp_count++;
@@ -792,12 +803,13 @@ void watch_command(const char *args)
     /* A watchpoint covers the whole process, not just the thread that
      * was current when it was set, so every thread's debug registers
      * for this slot must be armed (new threads pick it up via
-     * propagate_watchpoints_to_thread when they are created). */
-    for (int i = 0; i < thread_count; i++) {
-        if (arm_watch_slot(threads[i].tid, slot, addr, size,
-                           access_mode) != 0)
-            return;
-    }
+     * propagate_watchpoints_to_thread when they are created). A given
+     * tid can fail here (ESRCH) if it exited a moment ago and hasn't
+     * been reaped yet - that thread can never write anything again,
+     * so skip it rather than aborting registration for every other,
+     * still-alive thread over one that's already gone. */
+    for (int i = 0; i < thread_count; i++)
+        arm_watch_slot(threads[i].tid, slot, addr, size, access_mode);
 
     watchpoint_t *wp = &watchpoints[slot];
 
@@ -1739,6 +1751,29 @@ void continue_execution()
                     ptrace(PTRACE_CONT, tid, 0, 0);
                     threads[idx].running = 1;
                 }
+            } else if (idx >= 0 && locked_tid != 0 && tid != locked_tid) {
+                /* We believed this tid was running, but a lock now
+                 * excludes it - leave it stopped and update our
+                 * bookkeeping to match reality. */
+                threads[idx].running = 0;
+            } else if (idx >= 0) {
+                /* Stray SIGSTOP for a tid we already believe is (and
+                 * should remain) running: a synchronization signal
+                 * from an earlier, already-finished
+                 * sync_stop_other_threads round, delivered late -
+                 * under CPU contention, delivery of a queued signal
+                 * can be delayed arbitrarily, well past the point
+                 * where that round moved on and this tid was already
+                 * legitimately resumed and doing further work. Once
+                 * that happens, nothing else ever revisits an
+                 * already-`running` tid, so failing to react here
+                 * would leave it parked in this ptrace-stop forever
+                 * (verified live: `t`/ptrace_stop in /proc, with its
+                 * whole process wedged on it via pthread_join). Absorb
+                 * it and resume immediately, exactly like
+                 * sync_stop_other_threads's own resume-and-reabsorb
+                 * path for this same class of stale signal. */
+                ptrace(PTRACE_CONT, tid, 0, 0);
             }
 
             continue;
