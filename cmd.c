@@ -104,9 +104,18 @@ int cmd_parse_line(const char *line, cmd_t *out,
         tmp[--len] = '\0';
 
     if (!strcmp(cmd, "run")) {
-        /* run takes one word as program path (same as old behavior) */
-        const char *after = NULL;
-        char *prog = dup_first_word(rest, &after);
+        /* run takes a file path as its argument; paths may contain '/' so
+         * we read up to the first whitespace rather than using is_word_char. */
+        const char *path_start = tmp;
+        const char *path_end = tmp;
+        while (*path_end && *path_end != ' ' && *path_end != '\t')
+            path_end++;
+        size_t path_len = (size_t)(path_end - path_start);
+        char *prog = path_len ? (char *)malloc(path_len + 1) : NULL;
+        if (prog) {
+            memcpy(prog, path_start, path_len);
+            prog[path_len] = '\0';
+        }
         out->kind = CMD_RUN;
         out->arg = prog ? prog : dup_str("");
     } else if (!strcmp(cmd, "c")) {

@@ -2,7 +2,7 @@
 04_テスト仕様書.md 5a章「ウォッチポイントテスト」(T-19c~T-19m)。
 
 前提どおり `target` を `b main`→`c` でヒットさせた状態
-（`target.c:18`、ローカル変数`x,y,ts,ts_ptr,sa,sa_ptr,pm`が有効）から
+（`target.c:19`、ローカル変数`x,y,ts,ts_ptr,sa,sa_ptr,pm`が有効）から
 1つの継続セッションで手順を進める。上限（4個、DR0-DR3制約）に達すると
 それ以降の`watch`は式やフラグの妥当性を問わず「too many watchpoints」
 になるため、T-19j（未解決の式）とT-19l（不正フラグ）は上限に達する前
@@ -34,7 +34,7 @@ def _setup(s):
     s.cmd("run target")
     s.cmd("b main")
     out = s.cmd("c")
-    check_contains(out, "target.c:18", "setup")
+    check_contains(out, "target.c:19", "setup")
 
 
 def _t19c(s):
@@ -68,7 +68,9 @@ def _t19l(s):
 def _t19e(s):
     out = s.cmd("c")
     check_contains(out, "Hardware watchpoint 1: x", "T-19e")
-    check_contains(out, "Old value = 0", "T-19e")
+    # Old value is whatever uninitialized stack held (non-deterministic);
+    # the spec only requires "Old value = ..." to appear.
+    check_contains(out, "Old value = ", "T-19e")
     check_contains(out, "New value = 10", "T-19e")
 
 

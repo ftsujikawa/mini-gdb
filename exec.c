@@ -16,6 +16,21 @@
  * to be currently selected. */
 static pid_t locked_tid = 0;
 
+/* Deferred step-over: when a user-visible breakpoint is hit, we restore
+ * the original instruction and rewind RIP but do NOT immediately single-step
+ * through it.  Instead we record the breakpoint address here and perform the
+ * single-step at the start of the next continue_execution() call.  This
+ * lets the user arm watchpoints while the process is logically "at" the
+ * breakpoint instruction (before it executes), so a watchpoint on a variable
+ * assigned by that instruction fires correctly on the next `c`.
+ *
+ * We store the address (not a pointer into breakpoints[]) so that an
+ * intervening `del` — which shifts the array — cannot leave us with a stale
+ * pointer.  At step-over time we look up the live breakpoint_t by address;
+ * if the breakpoint was deleted in the meantime we still do the single-step
+ * but skip the re-arm. */
+static unsigned long pending_bp_rearm_addr = 0;
+
 static int wait_for_exec(pid_t pid)
 {
     /* TRACEFORK/TRACEVFORK: the debuggee calling fork()/vfork() is
@@ -72,6 +87,7 @@ void run_target(char *program)
     dbg.load_base = 0;
     wp_count = 0; /* hardware watchpoints don't survive across processes */
     locked_tid = 0;
+    pending_bp_rearm_addr = 0;
 
     pid_t pid = fork();
 
@@ -1267,6 +1283,7 @@ void kill_process(void)
     wp_count = 0;
     thread_count = 0;
     locked_tid = 0;
+    pending_bp_rearm_addr = 0;
     dbg.running = 0;
     printf("[+] process killed (pid=%d)\n", dbg.pid);
 }
@@ -1645,6 +1662,46 @@ void continue_execution()
         return;
     }
 
+    /* If the previous `c` stopped at a user breakpoint, we deferred the
+     * single-step over the original instruction to now so that watchpoints
+     * set between the two `c` calls can observe the assignment correctly. */
+    if (pending_bp_rearm_addr != 0) {
+        unsigned long bp_addr = pending_bp_rearm_addr;
+        pending_bp_rearm_addr = 0;
+
+        if (ptrace(PTRACE_SINGLESTEP, dbg.current_tid, 0, 0) != -1) {
+            int ss_status;
+            if (waitpid(dbg.current_tid, &ss_status, __WALL) > 0) {
+                /* Re-arm only if the breakpoint still exists (it may have
+                 * been deleted while the process was stopped). */
+                breakpoint_t *live_bp = find_breakpoint(bp_addr);
+                if (live_bp)
+                    enable_breakpoint_tid(dbg.current_tid, live_bp);
+
+                if (WIFEXITED(ss_status) || WIFSIGNALED(ss_status)) {
+                    remove_thread(dbg.current_tid);
+                    if (thread_count == 0) {
+                        printf("[+] process exited\n");
+                        dbg.running = 0;
+                    }
+                    return;
+                }
+
+                if (WIFSTOPPED(ss_status)) {
+                    struct user_regs_struct regs;
+                    ptrace(PTRACE_GETREGS, dbg.current_tid, 0, &regs);
+                    int wp_status = check_watchpoints(dbg.current_tid, &regs);
+                    if (wp_status == 1) {
+                        sync_stop_other_threads(dbg.current_tid);
+                        return;
+                    }
+                }
+            }
+        }
+        /* Step-over done (no watchpoint fired); fall through to normal
+         * resume below. */
+    }
+
     for (int i = 0; i < thread_count; i++) {
         /* Under a scheduler lock, only the locked tid gets resumed;
          * every other thread is left stopped, with no exception for
@@ -1884,8 +1941,14 @@ void continue_execution()
             );
             show_stop_location(bp->addr);
 
-            if (step_over_breakpoint(tid, bp) != 0)
-                printf("[-] failed to re-enable breakpoint\n");
+            /* Defer the step-over: restore the original instruction and
+             * rewind RIP so the user sees the process logically positioned
+             * at the breakpoint (before it executes).  The single-step and
+             * re-arm happen at the start of the next continue_execution()
+             * call, after any watchpoints the user may arm in between. */
+            if (restore_breakpoint_tid(tid, bp) == 0)
+                rewind_rip(tid, bp->addr);
+            pending_bp_rearm_addr = bp->addr;
 
             return;
         }
